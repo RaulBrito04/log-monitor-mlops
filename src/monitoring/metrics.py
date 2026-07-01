@@ -31,6 +31,12 @@ ACTIVE_ALERTS = Gauge(
     ["severity"],
 )
 
+INCIDENT_ALERTS_TOTAL = Gauge(
+    "logmonitor_incident_alerts_total",
+    "Total alerts grouped by incident workflow status",
+    ["incident_status"],
+)
+
 ML_PREDICTIONS_TOTAL = Gauge(
     "logmonitor_ml_predictions_total",
     "Total hybrid predictions stored in PostgreSQL",
@@ -143,6 +149,7 @@ def refresh_monitoring_metrics(force: bool = False) -> None:
 
     ALERTS_TOTAL.clear()
     ACTIVE_ALERTS.clear()
+    INCIDENT_ALERTS_TOTAL.clear()
     ML_PREDICTIONS_TOTAL.clear()
 
     try:
@@ -172,6 +179,17 @@ def refresh_monitoring_metrics(force: bool = False) -> None:
                 """,
             ):
                 ACTIVE_ALERTS.labels(severity=severity).set(count)
+
+            for incident_status, count in _run_query(
+                cursor,
+                "incident_alerts_total",
+                """
+                SELECT COALESCE(incident_status, 'NEW') AS incident_status, COUNT(*)
+                FROM alerts
+                GROUP BY incident_status
+                """,
+            ):
+                INCIDENT_ALERTS_TOTAL.labels(incident_status=incident_status).set(count)
 
             log_count = _run_query(
                 cursor,
@@ -232,3 +250,4 @@ def refresh_monitoring_metrics(force: bool = False) -> None:
     )
 
     _LAST_REFRESH_TS = now
+

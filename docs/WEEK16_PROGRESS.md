@@ -43,6 +43,11 @@ Important note:
 ### 3. Incident workflow MVP
 Implemented a lightweight operator workflow directly on top of `alerts`.
 
+Follow-up completion in this branch:
+- Added an audit trail table for incident transitions (`alert_incident_history`).
+- Added Prometheus metric `logmonitor_incident_alerts_total{incident_status=...}`.
+- Exposed incident transition history in the dashboard alert detail view.
+
 Data model:
 - Added incident fields to `alerts` in `docker/init.sql`:
   - `incident_status`
@@ -97,5 +102,5 @@ Invoke-RestMethod -Method Post -Uri 'http://localhost:5001/api/alerts/incident' 
 ## What this means for the roadmap
 - `Feedback retraining evidence`: closed for this cycle.
 - `Final polish`: materially improved and demo-ready.
-- `Incident workflow MVP`: now implemented.
+- `Incident workflow MVP`: now implemented with audit trail and monitoring metric by incident status.
 - Highest-ROI remaining items after this are external validation/benchmark expansion and explanation extras, not the core feedback loop.

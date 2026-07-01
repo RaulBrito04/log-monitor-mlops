@@ -175,6 +175,33 @@ def render_alerts_page() -> None:
                 hide_index=True,
             )
 
+        st.subheader("Incident history")
+        try:
+            incident_history = data.fetch_incident_history(int(detail["id"]))
+        except Exception as exc:
+            render_error(f"Failed to load incident history: {exc}")
+            incident_history = []
+
+        incident_frame = _to_frame(incident_history)
+        if incident_frame.empty:
+            render_empty("No incident transitions have been recorded for this alert yet.")
+        else:
+            st.dataframe(
+                incident_frame[
+                    [
+                        "changed_at",
+                        "changed_by",
+                        "previous_status",
+                        "new_status",
+                        "previous_owner",
+                        "new_owner",
+                        "change_notes",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
     with playbook_col:
         st.subheader("Incident workflow")
         st.caption("Move alerts through NEW -> INVESTIGATING -> RESOLVED for operator handling.")

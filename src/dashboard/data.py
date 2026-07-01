@@ -273,6 +273,29 @@ def fetch_feedback_history(alert_id: int, limit: int = 20) -> list[dict[str, Any
     return _fetch_feedback_history(alert_id, limit)
 
 
+def _fetch_incident_history(alert_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    return _rows(
+        """
+        SELECT id, alert_id, previous_status, new_status,
+               COALESCE(previous_owner, '') AS previous_owner,
+               COALESCE(new_owner, '') AS new_owner,
+               COALESCE(change_notes, '') AS change_notes,
+               COALESCE(changed_by, '') AS changed_by,
+               changed_at
+        FROM alert_incident_history
+        WHERE alert_id = %s
+        ORDER BY changed_at DESC, id DESC
+        LIMIT %s
+        """,
+        (alert_id, limit),
+    )
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_incident_history(alert_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    return _fetch_incident_history(alert_id, limit)
+
+
 def submit_alert_feedback(alert_id: int, label: str, reason: str, user_id: str) -> dict[str, Any]:
     payload = _flask_post(
         "/api/alerts/feedback",
@@ -470,6 +493,7 @@ def clear_dashboard_caches() -> None:
     fetch_alerts.clear()
     fetch_alert_detail.clear()
     fetch_feedback_history.clear()
+    fetch_incident_history.clear()
     fetch_logs_for_ids.clear()
     fetch_logs.clear()
     fetch_log_context.clear()

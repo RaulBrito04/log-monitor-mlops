@@ -325,6 +325,8 @@ class TestAlertIncidentWorkflow:
                 "incident_notes": "triaged",
                 "incident_updated_at": "2026-07-01T11:20:00+00:00",
                 "incident_updated_by": "analyst",
+                "history_id": 21,
+                "history_changed_at": "2026-07-01T11:20:00+00:00",
             },
         ) as update_incident:
             response = client.post(
@@ -342,6 +344,7 @@ class TestAlertIncidentWorkflow:
         payload = response.get_json()
         assert payload["status"] == "updated"
         assert payload["incident"]["incident_status"] == "INVESTIGATING"
+        assert payload["incident"]["history_id"] == 21
         update_incident.assert_called_once_with(
             alert_id=7,
             incident_status="INVESTIGATING",

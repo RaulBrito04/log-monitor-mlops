@@ -177,6 +177,27 @@ def _ensure_incident_workflow_schema() -> None:
             )
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_incident_status ON alerts(incident_status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_incident_owner ON alerts(incident_owner)")
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS alert_incident_history (
+                    id SERIAL PRIMARY KEY,
+                    alert_id INTEGER REFERENCES alerts(id) ON DELETE CASCADE,
+                    previous_status VARCHAR(20),
+                    new_status VARCHAR(20) NOT NULL CHECK (new_status IN ('NEW', 'INVESTIGATING', 'RESOLVED')),
+                    previous_owner VARCHAR(100),
+                    new_owner VARCHAR(100),
+                    change_notes TEXT,
+                    changed_by VARCHAR(100),
+                    changed_at TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alert_incident_history_alert_id ON alert_incident_history(alert_id)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alert_incident_history_changed_at ON alert_incident_history(changed_at DESC)"
+            )
         conn.commit()
 
 
@@ -214,7 +235,12 @@ def _update_alert_incident(
     with _db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT COALESCE(incident_status, 'NEW') FROM alerts WHERE id = %s",
+                """
+                SELECT COALESCE(incident_status, 'NEW'),
+                       COALESCE(incident_owner, '')
+                FROM alerts
+                WHERE id = %s
+                """,
                 (alert_id,),
             )
             row = cursor.fetchone()
@@ -222,6 +248,7 @@ def _update_alert_incident(
                 raise LookupError(f"Alert {alert_id} not found")
 
             current_status = str(row[0] or "NEW").upper()
+            current_owner = str(row[1] or "")
             allowed_statuses = ALLOWED_INCIDENT_TRANSITIONS.get(current_status, {current_status})
             if target_status not in allowed_statuses:
                 raise ValueError(f"invalid transition: {current_status} -> {target_status}")
@@ -241,6 +268,31 @@ def _update_alert_incident(
                 (target_status, normalized_owner, normalized_notes, user_id, alert_id),
             )
             updated = cursor.fetchone()
+            cursor.execute(
+                """
+                INSERT INTO alert_incident_history (
+                    alert_id,
+                    previous_status,
+                    new_status,
+                    previous_owner,
+                    new_owner,
+                    change_notes,
+                    changed_by
+                )
+                VALUES (%s, %s, %s, NULLIF(%s, ''), NULLIF(%s, ''), NULLIF(%s, ''), %s)
+                RETURNING id, changed_at
+                """,
+                (
+                    alert_id,
+                    current_status,
+                    target_status,
+                    current_owner,
+                    normalized_owner,
+                    normalized_notes,
+                    user_id,
+                ),
+            )
+            history_id, changed_at = cursor.fetchone()
         conn.commit()
 
     return {
@@ -250,6 +302,8 @@ def _update_alert_incident(
         "incident_notes": updated[3] or "",
         "incident_updated_at": updated[4].isoformat(),
         "incident_updated_by": updated[5],
+        "history_id": int(history_id),
+        "history_changed_at": changed_at.isoformat(),
     }
 
 
@@ -576,6 +630,10 @@ if __name__ == "__main__":
     host = os.getenv("FLASK_HOST", "127.0.0.1")
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     app.run(host=host, port=port, debug=debug)
+
+
+
+
 
 
 

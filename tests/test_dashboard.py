@@ -171,6 +171,22 @@ def test_fetch_feedback_history_uses_alert_id(monkeypatch):
     assert captured["params"] == (7, 5)
 
 
+def test_fetch_incident_history_uses_alert_id(monkeypatch):
+    captured = {}
+
+    def fake_rows(sql, params=()):
+        captured["sql"] = sql
+        captured["params"] = params
+        return []
+
+    monkeypatch.setattr(data, "_rows", fake_rows)
+
+    data._fetch_incident_history(9, 4)
+
+    assert "FROM alert_incident_history" in captured["sql"]
+    assert captured["params"] == (9, 4)
+
+
 def test_submit_alert_feedback_posts_and_clears_caches(monkeypatch):
     captured = {"cleared": False}
 
@@ -347,6 +363,7 @@ def test_render_alerts_page_smoke(monkeypatch):
     )
     monkeypatch.setattr(pages_impl.data, "fetch_logs_for_ids", lambda *args, **kwargs: [])
     monkeypatch.setattr(pages_impl.data, "fetch_feedback_history", lambda *args, **kwargs: [])
+    monkeypatch.setattr(pages_impl.data, "fetch_incident_history", lambda *args, **kwargs: [])
 
     pages_impl.render_alerts_page()
 

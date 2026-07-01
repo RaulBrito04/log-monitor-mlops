@@ -28,6 +28,7 @@ class TestMonitoringRefresh:
         metrics._LAST_REFRESH_TS = 0.0
         metrics.ALERTS_TOTAL.clear()
         metrics.ACTIVE_ALERTS.clear()
+        metrics.INCIDENT_ALERTS_TOTAL.clear()
         metrics.ML_PREDICTIONS_TOTAL.clear()
 
         cursor = mocker.Mock()
@@ -40,6 +41,7 @@ class TestMonitoringRefresh:
             side_effect=[
                 [("brute_force", "HIGH", 2), ("sql_injection", "CRITICAL", 1)],
                 [("HIGH", 2), ("CRITICAL", 1)],
+                [("INVESTIGATING", 2), ("RESOLVED", 1)],
                 [(25,)],
                 [("anomaly", 5), ("normal", 20)],
                 [(42.0,)],
@@ -66,6 +68,7 @@ class TestMonitoringRefresh:
         metrics.refresh_monitoring_metrics(force=True)
 
         assert metrics.ALERTS_TOTAL.labels(alert_type="brute_force", severity="HIGH")._value.get() == 2
+        assert metrics.INCIDENT_ALERTS_TOTAL.labels(incident_status="INVESTIGATING")._value.get() == 2
         assert metrics.LOGS_PROCESSED_TOTAL.labels(source="raw_logs")._value.get() == 25
         assert metrics.ML_MODEL_F1_SCORE.labels(model="hybrid_ensemble", dataset="holdout")._value.get() == 0.83
         assert metrics.ML_RETRAINING_BASELINE_AVAILABLE._value.get() == 1

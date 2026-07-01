@@ -50,6 +50,21 @@ CREATE INDEX idx_alerts_source ON alerts(source);
 CREATE INDEX idx_alerts_incident_status ON alerts(incident_status);
 CREATE INDEX idx_alerts_incident_owner ON alerts(incident_owner);
 
+CREATE TABLE alert_incident_history (
+    id SERIAL PRIMARY KEY,
+    alert_id INTEGER REFERENCES alerts(id) ON DELETE CASCADE,
+    previous_status VARCHAR(20),
+    new_status VARCHAR(20) NOT NULL CHECK (new_status IN ('NEW', 'INVESTIGATING', 'RESOLVED')),
+    previous_owner VARCHAR(100),
+    new_owner VARCHAR(100),
+    change_notes TEXT,
+    changed_by VARCHAR(100),
+    changed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_alert_incident_history_alert_id ON alert_incident_history(alert_id);
+CREATE INDEX idx_alert_incident_history_changed_at ON alert_incident_history(changed_at DESC);
+
 CREATE TABLE ml_predictions (
     id SERIAL PRIMARY KEY,
     log_id INTEGER,
@@ -114,5 +129,6 @@ CREATE INDEX idx_hybrid_scores_final_score ON hybrid_scores(final_score DESC);
 CREATE INDEX idx_hybrid_scores_severity ON hybrid_scores(severity);
 CREATE INDEX idx_hybrid_scores_is_anomaly ON hybrid_scores(is_anomaly);
 CREATE INDEX idx_hybrid_scores_created_at ON hybrid_scores(created_at DESC);
+
 
 
