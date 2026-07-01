@@ -4,6 +4,7 @@ omit =
     src/ml/feature_engineering.py
     src/ml/run_hybrid_pipeline.py
     src/ml/realtime_hybrid.py
+    src/ml/feedback_retraining.py
     src/flask_app/traffic_generator.py
     src/dashboard/Home.py
     src/dashboard/pages/*
