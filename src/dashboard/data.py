@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
@@ -37,6 +37,24 @@ def _rows(sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
 def _one(sql: str, params: Sequence[Any] = ()) -> dict[str, Any] | None:
     rows = _rows(sql, params)
     return rows[0] if rows else None
+
+
+def _flask_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    config = get_config()
+    response = requests.post(
+        f"{config.flask_api_url}{path}",
+        json=payload,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    try:
+        response_payload = response.json()
+    except ValueError:
+        response_payload = {}
+
+    if response.status_code >= 400:
+        message = response_payload.get("message") or response_payload.get("error") or f"HTTP {response.status_code}"
+        raise ValueError(message)
+    return response_payload
 
 
 def _prometheus_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -149,7 +167,11 @@ def _fetch_alert_options() -> dict[str, list[str]]:
     types = [row["alert_type"] for row in _rows("SELECT DISTINCT alert_type FROM alerts ORDER BY alert_type")]
     sources = [row["source"] for row in _rows("SELECT DISTINCT source FROM alerts ORDER BY source")]
     severities = [row["severity"] for row in _rows("SELECT DISTINCT severity FROM alerts ORDER BY severity")]
-    return {"types": types, "sources": sources, "severities": severities}
+    statuses = [
+        row["incident_status"]
+        for row in _rows("SELECT DISTINCT COALESCE(incident_status, 'NEW') AS incident_status FROM alerts ORDER BY incident_status")
+    ]
+    return {"types": types, "sources": sources, "severities": severities, "statuses": statuses}
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -161,6 +183,7 @@ def _fetch_alerts(
     severity: str = "ALL",
     alert_type: str = "ALL",
     source: str = "ALL",
+    incident_status: str = "ALL",
     ip_query: str = "",
     hours: int = 24,
     limit: int = 200,
@@ -169,6 +192,9 @@ def _fetch_alerts(
         """
         SELECT id, alert_type, severity, source, confidence, description,
                ip::text AS ip, timestamp, metadata, log_ids,
+               COALESCE(incident_status, 'NEW') AS incident_status,
+               COALESCE(incident_owner, '') AS incident_owner,
+               incident_updated_at, incident_updated_by,
                COALESCE(array_length(log_ids, 1), 0) AS related_logs
         FROM alerts
         WHERE timestamp > NOW() - (%s * INTERVAL '1 hour')
@@ -184,6 +210,9 @@ def _fetch_alerts(
     if source != "ALL":
         sql.append("AND source = %s")
         params.append(source)
+    if incident_status != "ALL":
+        sql.append("AND COALESCE(incident_status, 'NEW') = %s")
+        params.append(incident_status)
     if ip_query:
         sql.append("AND ip::text ILIKE %s")
         params.append(f"%{ip_query}%")
@@ -197,18 +226,23 @@ def fetch_alerts(
     severity: str = "ALL",
     alert_type: str = "ALL",
     source: str = "ALL",
+    incident_status: str = "ALL",
     ip_query: str = "",
     hours: int = 24,
     limit: int = 200,
 ) -> list[dict[str, Any]]:
-    return _fetch_alerts(severity, alert_type, source, ip_query, hours, limit)
+    return _fetch_alerts(severity, alert_type, source, incident_status, ip_query, hours, limit)
 
 
 def _fetch_alert_detail(alert_id: int) -> dict[str, Any] | None:
     return _one(
         """
         SELECT id, alert_type, severity, source, confidence, description,
-               ip::text AS ip, timestamp, metadata, log_ids, created_at
+               ip::text AS ip, timestamp, metadata, log_ids, created_at,
+               COALESCE(incident_status, 'NEW') AS incident_status,
+               COALESCE(incident_owner, '') AS incident_owner,
+               COALESCE(incident_notes, '') AS incident_notes,
+               incident_updated_at, incident_updated_by
         FROM alerts
         WHERE id = %s
         """,
@@ -219,6 +253,59 @@ def _fetch_alert_detail(alert_id: int) -> dict[str, Any] | None:
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_alert_detail(alert_id: int) -> dict[str, Any] | None:
     return _fetch_alert_detail(alert_id)
+
+
+def _fetch_feedback_history(alert_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    return _rows(
+        """
+        SELECT id, alert_id, user_id, label, reason, created_at
+        FROM feedback
+        WHERE alert_id = %s
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s
+        """,
+        (alert_id, limit),
+    )
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_feedback_history(alert_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    return _fetch_feedback_history(alert_id, limit)
+
+
+def submit_alert_feedback(alert_id: int, label: str, reason: str, user_id: str) -> dict[str, Any]:
+    payload = _flask_post(
+        "/api/alerts/feedback",
+        {
+            "alert_id": int(alert_id),
+            "label": label,
+            "reason": reason,
+            "user_id": user_id,
+        },
+    )
+    clear_dashboard_caches()
+    return payload
+
+
+def submit_alert_incident(
+    alert_id: int,
+    incident_status: str,
+    incident_owner: str,
+    incident_notes: str,
+    user_id: str,
+) -> dict[str, Any]:
+    payload = _flask_post(
+        "/api/alerts/incident",
+        {
+            "alert_id": int(alert_id),
+            "incident_status": incident_status,
+            "incident_owner": incident_owner,
+            "incident_notes": incident_notes,
+            "user_id": user_id,
+        },
+    )
+    clear_dashboard_caches()
+    return payload
 
 
 def _fetch_logs_for_ids(log_ids: tuple[int, ...], limit: int = 50) -> list[dict[str, Any]]:
@@ -382,9 +469,11 @@ def clear_dashboard_caches() -> None:
     fetch_alert_options.clear()
     fetch_alerts.clear()
     fetch_alert_detail.clear()
+    fetch_feedback_history.clear()
     fetch_logs_for_ids.clear()
     fetch_logs.clear()
     fetch_log_context.clear()
     fetch_prediction_split.clear()
     fetch_alert_trend.clear()
     fetch_ml_f1_history.clear()
+

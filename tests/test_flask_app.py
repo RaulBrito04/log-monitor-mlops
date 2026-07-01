@@ -4,6 +4,7 @@ Tests for the Flask application.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -248,3 +249,138 @@ class TestMiddleware:
             request_id = response.headers.get("X-Request-ID")
             assert request_id not in ids, "Duplicate request ID detected"
             ids.add(request_id)
+
+class TestAlertFeedback:
+    def test_valid_feedback_returns_201(self, client):
+        created_at = datetime(2026, 6, 30, 12, 0, tzinfo=timezone.utc)
+        with patch("src.flask_app.app._persist_feedback", return_value=(11, created_at)) as persist_feedback:
+            response = client.post(
+                "/api/alerts/feedback",
+                json={
+                    "alert_id": 7,
+                    "label": "false_positive",
+                    "reason": "Known scanner noise",
+                    "user_id": "analyst",
+                },
+            )
+
+        assert response.status_code == 201
+        payload = response.get_json()
+        assert payload["status"] == "created"
+        assert payload["feedback"]["id"] == 11
+        assert payload["feedback"]["alert_id"] == 7
+        assert payload["feedback"]["label"] == "false_positive"
+        persist_feedback.assert_called_once_with(
+            alert_id=7,
+            user_id="analyst",
+            label="false_positive",
+            reason="Known scanner noise",
+        )
+
+    def test_invalid_feedback_label_returns_400(self, client):
+        response = client.post(
+            "/api/alerts/feedback",
+            json={
+                "alert_id": 7,
+                "label": "maybe",
+                "reason": "invalid",
+                "user_id": "analyst",
+            },
+        )
+
+        assert response.status_code == 400
+        payload = response.get_json()
+        assert payload["error"] == "invalid_request"
+
+    def test_feedback_requires_json_body(self, client):
+        response = client.post("/api/alerts/feedback", data="plain text", content_type="text/plain")
+
+        assert response.status_code == 400
+        payload = response.get_json()
+        assert payload["error"] == "Request body must be JSON"
+
+    def test_unknown_alert_returns_404(self, client):
+        with patch("src.flask_app.app._persist_feedback", side_effect=LookupError("missing alert")):
+            response = client.post(
+                "/api/alerts/feedback",
+                json={
+                    "alert_id": 999,
+                    "label": "true_positive",
+                    "reason": "reviewed",
+                    "user_id": "analyst",
+                },
+            )
+
+        assert response.status_code == 404
+        payload = response.get_json()
+        assert payload["error"] == "not_found"
+class TestAlertIncidentWorkflow:
+    def test_valid_incident_update_returns_200(self, client):
+        with patch(
+            "src.flask_app.app._update_alert_incident",
+            return_value={
+                "id": 7,
+                "incident_status": "INVESTIGATING",
+                "incident_owner": "analyst",
+                "incident_notes": "triaged",
+                "incident_updated_at": "2026-07-01T11:20:00+00:00",
+                "incident_updated_by": "analyst",
+            },
+        ) as update_incident:
+            response = client.post(
+                "/api/alerts/incident",
+                json={
+                    "alert_id": 7,
+                    "incident_status": "INVESTIGATING",
+                    "incident_owner": "analyst",
+                    "incident_notes": "triaged",
+                    "user_id": "analyst",
+                },
+            )
+
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload["status"] == "updated"
+        assert payload["incident"]["incident_status"] == "INVESTIGATING"
+        update_incident.assert_called_once_with(
+            alert_id=7,
+            incident_status="INVESTIGATING",
+            incident_owner="analyst",
+            incident_notes="triaged",
+            user_id="analyst",
+        )
+
+    def test_invalid_incident_transition_returns_400(self, client):
+        with patch("src.flask_app.app._update_alert_incident", side_effect=ValueError("invalid transition: RESOLVED -> INVESTIGATING")):
+            response = client.post(
+                "/api/alerts/incident",
+                json={
+                    "alert_id": 7,
+                    "incident_status": "INVESTIGATING",
+                    "incident_owner": "analyst",
+                    "incident_notes": "reopen",
+                    "user_id": "analyst",
+                },
+            )
+
+        assert response.status_code == 400
+        payload = response.get_json()
+        assert payload["error"] == "invalid_transition"
+
+    def test_incident_update_unknown_alert_returns_404(self, client):
+        with patch("src.flask_app.app._update_alert_incident", side_effect=LookupError("missing alert")):
+            response = client.post(
+                "/api/alerts/incident",
+                json={
+                    "alert_id": 999,
+                    "incident_status": "INVESTIGATING",
+                    "incident_owner": "analyst",
+                    "incident_notes": "triaged",
+                    "user_id": "analyst",
+                },
+            )
+
+        assert response.status_code == 404
+        payload = response.get_json()
+        assert payload["error"] == "not_found"
+

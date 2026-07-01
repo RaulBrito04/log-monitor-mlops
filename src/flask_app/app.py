@@ -1,8 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import logging
 import os
 import time
+
+import psycopg2
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -18,6 +20,8 @@ from src.flask_app.config import AppConfig, get_demo_users
 from src.flask_app.limiter import init_limiter, limiter
 from src.flask_app.security import add_cache_headers, init_security_headers
 from src.flask_app.validators import (
+    AlertFeedbackPayload,
+    AlertIncidentUpdatePayload,
     LoginPayload,
     PaginationQuery,
     SearchQuery,
@@ -101,7 +105,7 @@ def setup_logging(log_file: str = LOG_FILE, level: str = LOG_LEVEL) -> logging.L
             file_handler.setFormatter(json_formatter)
             logger.addHandler(file_handler)
         except OSError:
-            logger.warning("Cannot write to log file %s — logging to stdout only", log_file)
+            logger.warning("Cannot write to log file %s - logging to stdout only", log_file)
 
     return logger
 
@@ -137,6 +141,118 @@ def require_admin(valid_users: dict[str, dict[str, str]]):
     return decorator
 
 
+def _db_connection():
+    return psycopg2.connect(
+        host=os.getenv("POSTGRES_HOST", "localhost"),
+        port=int(os.getenv("POSTGRES_PORT", "5432")),
+        database=os.getenv("POSTGRES_DB", "logmonitor"),
+        user=os.getenv("POSTGRES_USER", "postgres"),
+        password=os.getenv("POSTGRES_PASSWORD", "changeme"),
+    )
+
+
+INCIDENT_STATUSES = ("NEW", "INVESTIGATING", "RESOLVED")
+ALLOWED_INCIDENT_TRANSITIONS = {
+    "NEW": {"NEW", "INVESTIGATING"},
+    "INVESTIGATING": {"INVESTIGATING", "RESOLVED"},
+    "RESOLVED": {"RESOLVED"},
+}
+
+
+def _ensure_incident_workflow_schema() -> None:
+    with _db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS incident_status VARCHAR(20) DEFAULT 'NEW'")
+            cursor.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS incident_owner VARCHAR(100)")
+            cursor.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS incident_notes TEXT")
+            cursor.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS incident_updated_at TIMESTAMPTZ DEFAULT NOW()")
+            cursor.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS incident_updated_by VARCHAR(100)")
+            cursor.execute(
+                """
+                UPDATE alerts
+                SET incident_status = COALESCE(incident_status, 'NEW'),
+                    incident_updated_at = COALESCE(incident_updated_at, created_at, NOW())
+                WHERE incident_status IS NULL OR incident_updated_at IS NULL
+                """
+            )
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_incident_status ON alerts(incident_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_incident_owner ON alerts(incident_owner)")
+        conn.commit()
+
+
+def _persist_feedback(alert_id: int, user_id: str, label: str, reason: str) -> tuple[int, datetime]:
+    with _db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM alerts WHERE id = %s", (alert_id,))
+            if cursor.fetchone() is None:
+                raise LookupError(f"Alert {alert_id} not found")
+
+            cursor.execute(
+                """
+                INSERT INTO feedback (alert_id, user_id, label, reason)
+                VALUES (%s, %s, %s, NULLIF(%s, ''))
+                RETURNING id, created_at
+                """,
+                (alert_id, user_id, label, reason),
+            )
+            feedback_id, created_at = cursor.fetchone()
+        conn.commit()
+    return int(feedback_id), created_at
+
+
+def _update_alert_incident(
+    alert_id: int,
+    incident_status: str,
+    incident_owner: str,
+    incident_notes: str,
+    user_id: str,
+) -> dict[str, Any]:
+    target_status = incident_status.upper()
+    normalized_owner = incident_owner.strip() or user_id
+    normalized_notes = incident_notes.strip()
+
+    with _db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT COALESCE(incident_status, 'NEW') FROM alerts WHERE id = %s",
+                (alert_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise LookupError(f"Alert {alert_id} not found")
+
+            current_status = str(row[0] or "NEW").upper()
+            allowed_statuses = ALLOWED_INCIDENT_TRANSITIONS.get(current_status, {current_status})
+            if target_status not in allowed_statuses:
+                raise ValueError(f"invalid transition: {current_status} -> {target_status}")
+
+            cursor.execute(
+                """
+                UPDATE alerts
+                SET incident_status = %s,
+                    incident_owner = NULLIF(%s, ''),
+                    incident_notes = NULLIF(%s, ''),
+                    incident_updated_at = NOW(),
+                    incident_updated_by = %s
+                WHERE id = %s
+                RETURNING id, incident_status, incident_owner, incident_notes,
+                          incident_updated_at, incident_updated_by
+                """,
+                (target_status, normalized_owner, normalized_notes, user_id, alert_id),
+            )
+            updated = cursor.fetchone()
+        conn.commit()
+
+    return {
+        "id": int(updated[0]),
+        "incident_status": updated[1],
+        "incident_owner": updated[2],
+        "incident_notes": updated[3] or "",
+        "incident_updated_at": updated[4].isoformat(),
+        "incident_updated_by": updated[5],
+    }
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config.from_object(AppConfig)
@@ -155,6 +271,10 @@ def create_app() -> Flask:
     init_security_headers(app)
     add_cache_headers(app)
     init_limiter(app)
+    try:
+        _ensure_incident_workflow_schema()
+    except psycopg2.Error as exc:
+        logger.warning('Incident workflow schema sync skipped: %s', exc)
 
     @app.before_request
     def before_request() -> None:
@@ -283,6 +403,86 @@ def create_app() -> Flask:
     def get_users() -> tuple[Response, int]:
         return jsonify({"users": SAMPLE_USERS, "total": len(SAMPLE_USERS)}), 200
 
+    @app.route("/api/alerts/feedback", methods=["POST"])
+    @limiter.limit(os.getenv("RATELIMIT_FEEDBACK", "20 per minute"))
+    def post_alert_feedback() -> tuple[Response, int]:
+        payload_data = request.get_json(silent=True)
+        if not payload_data:
+            return jsonify({"error": "Request body must be JSON"}), 400
+
+        try:
+            payload = validate_model(AlertFeedbackPayload, payload_data)
+        except ValidationError as exc:
+            return jsonify({"error": "invalid_request", "message": first_validation_error(exc)}), 400
+
+        try:
+            feedback_id, created_at = _persist_feedback(
+                alert_id=payload.alert_id,
+                user_id=payload.user_id,
+                label=payload.label,
+                reason=payload.reason,
+            )
+        except LookupError:
+            return jsonify({"error": "not_found", "message": f"Alert {payload.alert_id} was not found"}), 404
+        except psycopg2.Error:
+            logger.exception("Failed to persist alert feedback")
+            return jsonify({"error": "database_error", "message": "Could not persist feedback"}), 500
+
+        g.log_entry.user = payload.user_id
+        g.log_entry.extra["feedback_label"] = payload.label
+        g.log_entry.extra["feedback_alert_id"] = payload.alert_id
+        g.log_entry.extra["feedback_saved"] = True
+
+        return jsonify(
+            {
+                "status": "created",
+                "feedback": {
+                    "id": feedback_id,
+                    "alert_id": payload.alert_id,
+                    "user_id": payload.user_id,
+                    "label": payload.label,
+                    "reason": payload.reason,
+                    "created_at": created_at.isoformat(),
+                },
+            }
+        ), 201
+
+    @app.route("/api/alerts/incident", methods=["POST"])
+    @limiter.limit(os.getenv("RATELIMIT_FEEDBACK", "20 per minute"))
+    def post_alert_incident() -> tuple[Response, int]:
+        payload_data = request.get_json(silent=True)
+        if not payload_data:
+            return jsonify({"error": "Request body must be JSON"}), 400
+
+        try:
+            payload = validate_model(AlertIncidentUpdatePayload, payload_data)
+        except ValidationError as exc:
+            return jsonify({"error": "invalid_request", "message": first_validation_error(exc)}), 400
+
+        try:
+            incident = _update_alert_incident(
+                alert_id=payload.alert_id,
+                incident_status=payload.incident_status,
+                incident_owner=payload.incident_owner,
+                incident_notes=payload.incident_notes,
+                user_id=payload.user_id,
+            )
+        except LookupError:
+            return jsonify({"error": "not_found", "message": f"Alert {payload.alert_id} was not found"}), 404
+        except ValueError as exc:
+            return jsonify({"error": "invalid_transition", "message": str(exc)}), 400
+        except psycopg2.Error:
+            logger.exception("Failed to update alert incident state")
+            return jsonify({"error": "database_error", "message": "Could not update incident state"}), 500
+
+        g.log_entry.user = payload.user_id
+        g.log_entry.extra["incident_alert_id"] = payload.alert_id
+        g.log_entry.extra["incident_status"] = payload.incident_status
+        g.log_entry.extra["incident_owner"] = payload.incident_owner or payload.user_id
+        g.log_entry.extra["incident_updated"] = True
+
+        return jsonify({"status": "updated", "incident": incident}), 200
+
     @app.route("/admin", methods=["GET"])
     @limiter.limit(os.getenv("RATELIMIT_ADMIN", "20 per minute"))
     @require_admin(valid_users)
@@ -376,3 +576,6 @@ if __name__ == "__main__":
     host = os.getenv("FLASK_HOST", "127.0.0.1")
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     app.run(host=host, port=port, debug=debug)
+
+
+

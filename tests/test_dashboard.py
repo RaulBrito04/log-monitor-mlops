@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from types import SimpleNamespace
 
@@ -8,11 +8,12 @@ from src.dashboard import auth, data, pages_impl
 
 
 class FakeStreamlit:
-    def __init__(self, select_value=None, submitted=True):
+    def __init__(self, select_value=None, submitted=True, button_value=False):
         self.session_state = {}
         self.sidebar = self
         self._select_value = select_value
         self._submitted = submitted
+        self._button_value = button_value
 
     def __enter__(self):
         return self
@@ -42,6 +43,9 @@ class FakeStreamlit:
     def text_input(self, *args, **kwargs):
         return ""
 
+    def text_area(self, *args, **kwargs):
+        return ""
+
     def form_submit_button(self, *args, **kwargs):
         return self._submitted
 
@@ -61,7 +65,7 @@ class FakeStreamlit:
         return None
 
     def button(self, *args, **kwargs):
-        return False
+        return self._button_value
 
     def metric(self, *args, **kwargs):
         return None
@@ -88,14 +92,15 @@ class FakeStreamlit:
         return None
 
     def selectbox(self, label, options, **kwargs):
-        if self._select_value is not None:
+        if self._select_value in options:
             return self._select_value
         return options[0] if options else None
 
 
 class FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200):
         self._payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self):
         return None
@@ -140,13 +145,85 @@ def test_fetch_alerts_builds_expected_filters(monkeypatch):
 
     monkeypatch.setattr(data, "_rows", fake_rows)
 
-    data._fetch_alerts("HIGH", "sql_injection", "rule", "10.0.0", 6, 50)
+    data._fetch_alerts("HIGH", "sql_injection", "rule", "INVESTIGATING", "10.0.0", 6, 50)
 
     assert "severity = %s" in captured["sql"]
     assert "alert_type = %s" in captured["sql"]
     assert "source = %s" in captured["sql"]
+    assert "COALESCE(incident_status, 'NEW') = %s" in captured["sql"]
     assert "ip::text ILIKE %s" in captured["sql"]
-    assert captured["params"] == [6, "HIGH", "sql_injection", "rule", "%10.0.0%", 50]
+    assert captured["params"] == [6, "HIGH", "sql_injection", "rule", "INVESTIGATING", "%10.0.0%", 50]
+
+
+def test_fetch_feedback_history_uses_alert_id(monkeypatch):
+    captured = {}
+
+    def fake_rows(sql, params=()):
+        captured["sql"] = sql
+        captured["params"] = params
+        return []
+
+    monkeypatch.setattr(data, "_rows", fake_rows)
+
+    data._fetch_feedback_history(7, 5)
+
+    assert "FROM feedback" in captured["sql"]
+    assert captured["params"] == (7, 5)
+
+
+def test_submit_alert_feedback_posts_and_clears_caches(monkeypatch):
+    captured = {"cleared": False}
+
+    def fake_post(path, payload):
+        captured["path"] = path
+        captured["payload"] = payload
+        return {"status": "created", "feedback": {"id": 1}}
+
+    def fake_clear():
+        captured["cleared"] = True
+
+    monkeypatch.setattr(data, "_flask_post", fake_post)
+    monkeypatch.setattr(data, "clear_dashboard_caches", fake_clear)
+
+    result = data.submit_alert_feedback(3, "false_positive", "noise", "analyst")
+
+    assert result["status"] == "created"
+    assert captured["path"] == "/api/alerts/feedback"
+    assert captured["payload"] == {
+        "alert_id": 3,
+        "label": "false_positive",
+        "reason": "noise",
+        "user_id": "analyst",
+    }
+    assert captured["cleared"] is True
+
+
+def test_submit_alert_incident_posts_and_clears_caches(monkeypatch):
+    captured = {"cleared": False}
+
+    def fake_post(path, payload):
+        captured["path"] = path
+        captured["payload"] = payload
+        return {"status": "updated", "incident": {"id": 3, "incident_status": "INVESTIGATING"}}
+
+    def fake_clear():
+        captured["cleared"] = True
+
+    monkeypatch.setattr(data, "_flask_post", fake_post)
+    monkeypatch.setattr(data, "clear_dashboard_caches", fake_clear)
+
+    result = data.submit_alert_incident(3, "INVESTIGATING", "analyst", "triaged", "analyst")
+
+    assert result["status"] == "updated"
+    assert captured["path"] == "/api/alerts/incident"
+    assert captured["payload"] == {
+        "alert_id": 3,
+        "incident_status": "INVESTIGATING",
+        "incident_owner": "analyst",
+        "incident_notes": "triaged",
+        "user_id": "analyst",
+    }
+    assert captured["cleared"] is True
 
 
 def test_prometheus_get_uses_configured_url(monkeypatch):
@@ -223,10 +300,11 @@ def test_render_alerts_page_smoke(monkeypatch):
     monkeypatch.setattr(pages_impl, "st", fake_st)
     monkeypatch.setattr(pages_impl, "st_autorefresh", lambda **kwargs: None)
     monkeypatch.setattr(pages_impl, "render_sidebar", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pages_impl, "current_user", lambda: "analyst")
     monkeypatch.setattr(
         pages_impl.data,
         "fetch_alert_options",
-        lambda: {"severities": ["HIGH"], "types": ["sql_injection"], "sources": ["rule"]},
+        lambda: {"severities": ["HIGH"], "types": ["sql_injection"], "sources": ["rule"], "statuses": ["NEW", "INVESTIGATING", "RESOLVED"]},
     )
     monkeypatch.setattr(
         pages_impl.data,
@@ -239,6 +317,8 @@ def test_render_alerts_page_smoke(monkeypatch):
                 "source": "rule",
                 "ip": "10.0.0.5",
                 "timestamp": pd.Timestamp("2026-04-13T12:00:00Z"),
+                "incident_status": "NEW",
+                "incident_owner": "analyst",
                 "related_logs": 2,
                 "confidence": 1.0,
             }
@@ -258,9 +338,15 @@ def test_render_alerts_page_smoke(monkeypatch):
             "description": "Test alert",
             "metadata": {"attempts": 2},
             "log_ids": [1001, 1002],
+            "incident_status": "NEW",
+            "incident_owner": "analyst",
+            "incident_notes": "queued",
+            "incident_updated_at": pd.Timestamp("2026-04-13T12:05:00Z"),
+            "incident_updated_by": "analyst",
         },
     )
     monkeypatch.setattr(pages_impl.data, "fetch_logs_for_ids", lambda *args, **kwargs: [])
+    monkeypatch.setattr(pages_impl.data, "fetch_feedback_history", lambda *args, **kwargs: [])
 
     pages_impl.render_alerts_page()
 
@@ -323,3 +409,5 @@ def test_render_model_monitoring_page_smoke(monkeypatch):
     )
 
     pages_impl.render_model_monitoring_page()
+
+

@@ -43,6 +43,46 @@ ML_MODEL_F1_SCORE = Gauge(
     ["model", "dataset"],
 )
 
+ML_RETRAINING_BASELINE_AVAILABLE = Gauge(
+    "logmonitor_ml_retraining_baseline_available",
+    "Whether a current baseline model was available for the latest reviewed-feedback retraining run",
+)
+
+ML_RETRAINING_CANDIDATE_AVAILABLE = Gauge(
+    "logmonitor_ml_retraining_candidate_available",
+    "Whether the latest reviewed-feedback retraining run produced a candidate model",
+)
+
+ML_RETRAINING_PROMOTABLE = Gauge(
+    "logmonitor_ml_retraining_promotable",
+    "Whether the latest reviewed-feedback candidate satisfied the promotion gate",
+)
+
+ML_RETRAINING_ELIGIBLE_FEEDBACK_EVENTS = Gauge(
+    "logmonitor_ml_retraining_feedback_events",
+    "Eligible feedback events used by the latest reviewed-feedback retraining run",
+)
+
+ML_RETRAINING_READY_LOG_SAMPLES = Gauge(
+    "logmonitor_ml_retraining_ready_log_samples",
+    "Training-ready reviewed log samples in the latest reviewed-feedback retraining run",
+)
+
+ML_RETRAINING_REVIEWED_F1_DELTA = Gauge(
+    "logmonitor_ml_retraining_reviewed_f1_delta",
+    "Reviewed holdout F1 delta between the latest candidate and current baseline",
+)
+
+ML_RETRAINING_TEMPORAL_F1_DELTA = Gauge(
+    "logmonitor_ml_retraining_temporal_f1_delta",
+    "Temporal holdout F1 delta between the latest candidate and current baseline",
+)
+
+ML_RETRAINING_TEMPORAL_PRECISION_DELTA = Gauge(
+    "logmonitor_ml_retraining_temporal_precision_delta",
+    "Temporal holdout precision delta between the latest candidate and current baseline",
+)
+
 LOGS_PROCESSED_TOTAL = Gauge(
     "logmonitor_logs_processed_total",
     "Total processed logs stored in PostgreSQL",
@@ -172,6 +212,16 @@ def refresh_monitoring_metrics(force: bool = False) -> None:
     model_name = str(runtime_metrics.get("model", "hybrid_ensemble"))
     dataset_name = str(runtime_metrics.get("dataset", "holdout"))
     ML_MODEL_F1_SCORE.labels(model=model_name, dataset=dataset_name).set(f1_value)
+    ML_RETRAINING_BASELINE_AVAILABLE.set(float(runtime_metrics.get("retraining_baseline_available", 0.0) or 0.0))
+    ML_RETRAINING_CANDIDATE_AVAILABLE.set(float(runtime_metrics.get("retraining_candidate_available", 0.0) or 0.0))
+    ML_RETRAINING_PROMOTABLE.set(float(runtime_metrics.get("retraining_promotable", 0.0) or 0.0))
+    ML_RETRAINING_ELIGIBLE_FEEDBACK_EVENTS.set(float(runtime_metrics.get("retraining_feedback_events", 0.0) or 0.0))
+    ML_RETRAINING_READY_LOG_SAMPLES.set(float(runtime_metrics.get("retraining_ready_log_samples", 0.0) or 0.0))
+    ML_RETRAINING_REVIEWED_F1_DELTA.set(float(runtime_metrics.get("retraining_reviewed_f1_delta", 0.0) or 0.0))
+    ML_RETRAINING_TEMPORAL_F1_DELTA.set(float(runtime_metrics.get("retraining_temporal_f1_delta", 0.0) or 0.0))
+    ML_RETRAINING_TEMPORAL_PRECISION_DELTA.set(
+        float(runtime_metrics.get("retraining_temporal_precision_delta", 0.0) or 0.0)
+    )
 
     MONITORING_INFO.info(
         {

@@ -77,11 +77,13 @@ services:
       RATELIMIT_ADMIN: ${RATELIMIT_ADMIN:-20 per minute}
       RATELIMIT_SEARCH: ${RATELIMIT_SEARCH:-30 per minute}
       RATELIMIT_UPLOAD: ${RATELIMIT_UPLOAD:-10 per minute}
+      RATELIMIT_FEEDBACK: ${RATELIMIT_FEEDBACK:-20 per minute}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-5}
     ports:
       - "5001:5001"
     volumes:
       - logs_data:/app/logs
+      - ../data:/app/data:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5001/health', timeout=5).raise_for_status()"]
       interval: 15s
@@ -107,7 +109,7 @@ services:
       flask-app:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - http://localhost:8080/health >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/health >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -128,6 +130,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
       PROMETHEUS_URL: ${PROMETHEUS_URL:-http://prometheus:9090}
+      FLASK_API_URL: ${FLASK_API_URL:-http://flask-app:5001}
       DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-admin}
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-admin}
       DASHBOARD_REFRESH_SECONDS: ${DASHBOARD_REFRESH_SECONDS:-30}
@@ -135,6 +138,8 @@ services:
       - "8501:8501"
     depends_on:
       postgres:
+        condition: service_healthy
+      flask-app:
         condition: service_healthy
       prometheus:
         condition: service_started
@@ -205,6 +210,7 @@ services:
     volumes:
       - models_data:/app/models
       - mlflow_data:/mlruns
+      - ../data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -295,3 +301,4 @@ volumes:
     driver: local
   alertmanager_data:
     driver: local
+

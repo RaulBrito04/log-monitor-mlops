@@ -1,4 +1,4 @@
-﻿groups:
+groups:
   - name: logmonitor-core
     rules:
       - alert: FlaskAppDown
@@ -40,6 +40,16 @@
         annotations:
           summary: "ML F1 below target"
           description: "The operational F1 metric is below the 0.75 target."
+
+      - alert: MLRetrainingDegraded
+        expr: logmonitor_ml_retraining_candidate_available > 0 and logmonitor_ml_retraining_baseline_available > 0 and (logmonitor_ml_retraining_reviewed_f1_delta < 0 or logmonitor_ml_retraining_temporal_f1_delta < -0.01 or logmonitor_ml_retraining_temporal_precision_delta < -0.02)
+        for: 5m
+        labels:
+          severity: warning
+          component: ml
+        annotations:
+          summary: "Retraining candidate regressed"
+          description: "The latest reviewed-feedback candidate underperformed the current baseline on reviewed or temporal holdout metrics."
 
       - alert: DataFreshnessHigh
         expr: logmonitor_data_freshness_seconds > 300

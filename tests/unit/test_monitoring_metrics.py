@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import time
@@ -47,7 +47,19 @@ class TestMonitoringRefresh:
         )
         mocker.patch(
             "src.monitoring.metrics._load_runtime_metrics",
-            return_value={"ml_f1_score": 0.83, "model": "hybrid_ensemble", "dataset": "holdout"},
+            return_value={
+                "ml_f1_score": 0.83,
+                "model": "hybrid_ensemble",
+                "dataset": "holdout",
+                "retraining_baseline_available": 1,
+                "retraining_candidate_available": 1,
+                "retraining_promotable": 0,
+                "retraining_feedback_events": 40,
+                "retraining_ready_log_samples": 80,
+                "retraining_reviewed_f1_delta": -0.03,
+                "retraining_temporal_f1_delta": -0.02,
+                "retraining_temporal_precision_delta": -0.01,
+            },
         )
         info = mocker.patch.object(metrics.MONITORING_INFO, "info")
 
@@ -56,6 +68,14 @@ class TestMonitoringRefresh:
         assert metrics.ALERTS_TOTAL.labels(alert_type="brute_force", severity="HIGH")._value.get() == 2
         assert metrics.LOGS_PROCESSED_TOTAL.labels(source="raw_logs")._value.get() == 25
         assert metrics.ML_MODEL_F1_SCORE.labels(model="hybrid_ensemble", dataset="holdout")._value.get() == 0.83
+        assert metrics.ML_RETRAINING_BASELINE_AVAILABLE._value.get() == 1
+        assert metrics.ML_RETRAINING_CANDIDATE_AVAILABLE._value.get() == 1
+        assert metrics.ML_RETRAINING_PROMOTABLE._value.get() == 0
+        assert metrics.ML_RETRAINING_ELIGIBLE_FEEDBACK_EVENTS._value.get() == 40
+        assert metrics.ML_RETRAINING_READY_LOG_SAMPLES._value.get() == 80
+        assert metrics.ML_RETRAINING_REVIEWED_F1_DELTA._value.get() == -0.03
+        assert metrics.ML_RETRAINING_TEMPORAL_F1_DELTA._value.get() == -0.02
+        assert metrics.ML_RETRAINING_TEMPORAL_PRECISION_DELTA._value.get() == -0.01
         assert metrics.DATA_FRESHNESS_SECONDS._value.get() == 42.0
         info.assert_called_once()
         conn.close.assert_called_once()

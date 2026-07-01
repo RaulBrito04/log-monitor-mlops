@@ -34,6 +34,11 @@ CREATE TABLE alerts (
     ip INET,
     timestamp TIMESTAMPTZ NOT NULL,
     metadata JSONB,
+    incident_status VARCHAR(20) NOT NULL DEFAULT 'NEW' CHECK (incident_status IN ('NEW', 'INVESTIGATING', 'RESOLVED')),
+    incident_owner VARCHAR(100),
+    incident_notes TEXT,
+    incident_updated_at TIMESTAMPTZ DEFAULT NOW(),
+    incident_updated_by VARCHAR(100),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -42,6 +47,8 @@ CREATE INDEX idx_alerts_severity ON alerts(severity);
 CREATE INDEX idx_alerts_type ON alerts(alert_type);
 CREATE INDEX idx_alerts_ip ON alerts(ip);
 CREATE INDEX idx_alerts_source ON alerts(source);
+CREATE INDEX idx_alerts_incident_status ON alerts(incident_status);
+CREATE INDEX idx_alerts_incident_owner ON alerts(incident_owner);
 
 CREATE TABLE ml_predictions (
     id SERIAL PRIMARY KEY,
@@ -107,3 +114,5 @@ CREATE INDEX idx_hybrid_scores_final_score ON hybrid_scores(final_score DESC);
 CREATE INDEX idx_hybrid_scores_severity ON hybrid_scores(severity);
 CREATE INDEX idx_hybrid_scores_is_anomaly ON hybrid_scores(is_anomaly);
 CREATE INDEX idx_hybrid_scores_created_at ON hybrid_scores(created_at DESC);
+
+

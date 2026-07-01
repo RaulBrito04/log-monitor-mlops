@@ -1,10 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from src.dashboard import data
+from src.dashboard.auth import current_user
 from src.dashboard.config import get_config
 from src.dashboard.playbooks import get_playbook
 from src.dashboard.ui import format_timestamp, humanize_seconds, render_empty, render_error, render_sidebar
@@ -87,15 +88,16 @@ def render_alerts_page() -> None:
         render_error(f"Failed to load alert filter options: {exc}")
         return
 
-    f1, f2, f3, f4, f5 = st.columns(5)
+    f1, f2, f3, f4, f5, f6 = st.columns(6)
     severity = f1.selectbox("Severity", ["ALL", *options.get("severities", [])])
     alert_type = f2.selectbox("Alert type", ["ALL", *options.get("types", [])])
     source = f3.selectbox("Source", ["ALL", *options.get("sources", [])])
-    hours = f4.selectbox("Time window", [1, 6, 24, 72], index=2)
-    ip_query = f5.text_input("IP contains")
+    incident_status = f4.selectbox("Incident status", ["ALL", *options.get("statuses", [])])
+    hours = f5.selectbox("Time window", [1, 6, 24, 72], index=2)
+    ip_query = f6.text_input("IP contains")
 
     try:
-        alerts = data.fetch_alerts(severity, alert_type, source, ip_query, int(hours))
+        alerts = data.fetch_alerts(severity, alert_type, source, incident_status, ip_query, int(hours))
     except Exception as exc:
         render_error(f"Failed to load alerts: {exc}")
         return
@@ -107,7 +109,7 @@ def render_alerts_page() -> None:
         return
 
     st.dataframe(
-        alerts_frame[["id", "alert_type", "severity", "source", "ip", "timestamp", "related_logs", "confidence"]],
+        alerts_frame[["id", "alert_type", "severity", "source", "incident_status", "incident_owner", "ip", "timestamp", "related_logs", "confidence"]],
         use_container_width=True,
         hide_index=True,
     )
@@ -141,6 +143,11 @@ def render_alerts_page() -> None:
                 "confidence": detail["confidence"],
                 "ip": detail["ip"],
                 "timestamp": format_timestamp(detail["timestamp"]),
+                "incident_status": detail.get("incident_status") or "NEW",
+                "incident_owner": detail.get("incident_owner") or "",
+                "incident_notes": detail.get("incident_notes") or "",
+                "incident_updated_at": format_timestamp(detail.get("incident_updated_at")),
+                "incident_updated_by": detail.get("incident_updated_by") or "",
                 "related_log_ids": detail.get("log_ids") or [],
                 "metadata": detail.get("metadata") or {},
             },
@@ -151,11 +158,86 @@ def render_alerts_page() -> None:
             st.subheader("Related logs")
             st.dataframe(_to_frame(related_logs), use_container_width=True, hide_index=True)
 
+        st.subheader("Feedback history")
+        try:
+            feedback_history = data.fetch_feedback_history(int(detail["id"]))
+        except Exception as exc:
+            render_error(f"Failed to load feedback history: {exc}")
+            feedback_history = []
+
+        feedback_frame = _to_frame(feedback_history)
+        if feedback_frame.empty:
+            render_empty("No analyst feedback has been recorded for this alert yet.")
+        else:
+            st.dataframe(
+                feedback_frame[["created_at", "user_id", "label", "reason"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
     with playbook_col:
+        st.subheader("Incident workflow")
+        st.caption("Move alerts through NEW -> INVESTIGATING -> RESOLVED for operator handling.")
+        user_id = current_user() or "dashboard"
+        incident_options = ["NEW", "INVESTIGATING", "RESOLVED"]
+        current_status = str(detail.get("incident_status") or "NEW")
+        current_index = incident_options.index(current_status) if current_status in incident_options else 0
+        incident_owner = st.text_input(
+            "Incident owner",
+            value=detail.get("incident_owner") or user_id,
+            key=f"incident-owner-{detail['id']}",
+        )
+        next_status = st.selectbox(
+            "Incident status",
+            options=incident_options,
+            index=current_index,
+            key=f"incident-status-{detail['id']}",
+        )
+        incident_notes = st.text_area(
+            "Incident notes",
+            value=detail.get("incident_notes") or "",
+            key=f"incident-notes-{detail['id']}",
+            placeholder="What has been investigated, blocked, or resolved?",
+        )
+        if st.button("Update incident", key=f"incident-submit-{detail['id']}", use_container_width=True):
+            try:
+                data.submit_alert_incident(int(detail["id"]), next_status, incident_owner.strip(), incident_notes.strip(), user_id)
+            except Exception as exc:
+                render_error(f"Failed to update incident: {exc}")
+            else:
+                st.success("Incident updated.")
+                st.rerun()
+
+        st.caption(
+            f"Last incident update: {format_timestamp(detail.get('incident_updated_at'))}"
+            f" by {detail.get('incident_updated_by') or 'system'}"
+        )
+
         st.subheader(playbook["title"])
         st.write(playbook["summary"])
         for step in playbook["steps"]:
             st.write(f"- {step}")
+
+        st.subheader("Analyst feedback")
+        st.caption("Store a reviewed label for this alert. This is the first step for future retraining workflows.")
+        label = st.selectbox(
+            "Reviewed label",
+            options=["true_positive", "false_positive", "false_negative"],
+            key=f"feedback-label-{detail['id']}",
+        )
+        reason = st.text_area(
+            "Reason / notes",
+            key=f"feedback-reason-{detail['id']}",
+            placeholder="Why is this alert correct, noisy, or missing context?",
+        )
+        if st.button("Save feedback", key=f"feedback-submit-{detail['id']}", use_container_width=True):
+            try:
+                data.submit_alert_feedback(int(detail["id"]), label, reason.strip(), user_id)
+            except Exception as exc:
+                render_error(f"Failed to save feedback: {exc}")
+            else:
+                st.success("Feedback saved.")
+                st.rerun()
 
 
 def render_log_explorer_page() -> None:
@@ -267,3 +349,4 @@ def render_model_monitoring_page() -> None:
         render_empty("No Prometheus F1 history is available yet.")
     else:
         st.line_chart(f1_history.set_index("timestamp")["f1_score"])
+
