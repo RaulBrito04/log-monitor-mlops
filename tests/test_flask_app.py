@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from src.flask_app import app as app_module
 from src.flask_app.app import create_app
 
 
@@ -386,4 +387,57 @@ class TestAlertIncidentWorkflow:
         assert response.status_code == 404
         payload = response.get_json()
         assert payload["error"] == "not_found"
+class TestIncidentLifecycleHelper:
+    def test_update_alert_incident_resolves_and_writes_history(self):
+        updated_at = datetime(2026, 7, 1, 12, 20, tzinfo=timezone.utc)
+        conn = MagicMock()
+        cursor_manager = MagicMock()
+        cursor = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.cursor.return_value = cursor_manager
+        cursor_manager.__enter__.return_value = cursor
+        cursor.fetchone.side_effect = [
+            ("INVESTIGATING", "analyst"),
+            (7, "RESOLVED", "analyst", "resolved after review", updated_at, "analyst"),
+            (31, updated_at),
+        ]
+
+        with patch.object(app_module, "_db_connection", return_value=conn):
+            incident = app_module._update_alert_incident(
+                alert_id=7,
+                incident_status="RESOLVED",
+                incident_owner="analyst",
+                incident_notes="resolved after review",
+                user_id="analyst",
+            )
+
+        assert incident["incident_status"] == "RESOLVED"
+        assert incident["history_id"] == 31
+        assert incident["history_changed_at"] == updated_at.isoformat()
+        executed_sql = " ".join(call.args[0] for call in cursor.execute.call_args_list)
+        assert "UPDATE alerts" in executed_sql
+        assert "INSERT INTO alert_incident_history" in executed_sql
+        conn.commit.assert_called_once()
+
+    def test_update_alert_incident_rejects_skipping_directly_to_resolved(self):
+        conn = MagicMock()
+        cursor_manager = MagicMock()
+        cursor = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.cursor.return_value = cursor_manager
+        cursor_manager.__enter__.return_value = cursor
+        cursor.fetchone.return_value = ("NEW", "")
+
+        with patch.object(app_module, "_db_connection", return_value=conn):
+            with pytest.raises(ValueError, match="invalid transition: NEW -> RESOLVED"):
+                app_module._update_alert_incident(
+                    alert_id=7,
+                    incident_status="RESOLVED",
+                    incident_owner="analyst",
+                    incident_notes="skip triage",
+                    user_id="analyst",
+                )
+
+        assert cursor.execute.call_count == 1
+        conn.commit.assert_not_called()
 

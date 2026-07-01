@@ -33,7 +33,7 @@ Runtime verification after rebuild:
 - `docker compose -f docker/docker-compose.yml config` succeeded.
 - `flask-app`, `dashboard`, `ingester`, and `nginx-validation` were healthy.
 - `/metrics` exposed the retraining gauges listed above.
-- Targeted regression suite passed: `73 passed`.
+- Targeted regression suite passed: `76 passed` after closing the full incident lifecycle tests.
 
 Important note:
 - `logmonitor_ml_model_f1_score` remains `0.0` unless an operational F1 value is explicitly published to `/metrics/ml_quality`.
@@ -73,10 +73,12 @@ Dashboard:
   - inline incident update form in the alert detail panel
 
 Functional validation:
-- Real API update executed successfully.
-- Verified response:
-  - `updated_alert_id=1`
-  - status updated to `INVESTIGATING`
+- Real API updates executed successfully for both lifecycle transitions.
+- Verified responses:
+  - `updated_alert_id=3270`
+  - status updated from `NEW` to `INVESTIGATING`
+  - status updated from `INVESTIGATING` to `RESOLVED`
+  - audit trail row written to `alert_incident_history`
 
 ## Commands used for verification
 
@@ -104,3 +106,4 @@ Invoke-RestMethod -Method Post -Uri 'http://localhost:5001/api/alerts/incident' 
 - `Final polish`: materially improved and demo-ready.
 - `Incident workflow MVP`: now implemented with audit trail and monitoring metric by incident status.
 - Highest-ROI remaining items after this are external validation/benchmark expansion and explanation extras, not the core feedback loop.
+
