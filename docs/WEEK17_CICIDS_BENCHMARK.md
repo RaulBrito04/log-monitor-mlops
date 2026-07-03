@@ -29,7 +29,13 @@ mkdir -p data/cicids
 # copiar CSVs para data/cicids/
 ```
 
-Depois corre:
+Depois corre com o runner preparado nesta branch:
+
+```bash
+bash scripts/run_cicids_benchmark.sh data/cicids
+```
+
+Se preferires, tambem podes chamar o modulo diretamente:
 
 ```bash
 ./venv/bin/python -m src.ml.cicids_benchmark \
@@ -41,7 +47,7 @@ Depois corre:
 Tambem podes apontar diretamente para um CSV:
 
 ```bash
-./venv/bin/python -m src.ml.cicids_benchmark --input data/cicids/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv
+bash scripts/run_cicids_benchmark.sh data/cicids/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv
 ```
 
 ## Outputs
@@ -54,3 +60,11 @@ Tambem podes apontar diretamente para um CSV:
 - correr o benchmark com o dataset real localmente
 - guardar os resultados finais do run
 - comparar metricas com os resultados internos/sinteticos no relatorio
+## Estado atual desta branch
+
+- harness do benchmark implementado
+- testes unitarios do benchmark a verde
+- runner `scripts/run_cicids_benchmark.sh` smoke-tested com fixture temporario
+- execucao com o dataset CICIDS-2017 real ainda pendente por ausencia dos CSVs nesta maquina
+
+
