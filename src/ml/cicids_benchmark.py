@@ -18,6 +18,8 @@ from sklearn.preprocessing import StandardScaler
 DEFAULT_REPORT_PATH = Path("experiments/cicids_benchmark_report.json")
 DEFAULT_MARKDOWN_PATH = Path("experiments/cicids_benchmark_report.md")
 THRESHOLD_QUANTILES = (0.80, 0.84, 0.88, 0.90, 0.92, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99)
+DEFAULT_MAX_TRAIN_ROWS = 60_000
+DEFAULT_MAX_EVAL_ROWS = 40_000
 
 
 def normalize_column_name(name: str) -> str:
@@ -39,10 +41,23 @@ def resolve_csv_paths(inputs: list[str | Path]) -> list[Path]:
     return unique_paths
 
 
+def read_cicids_csv(csv_path: Path) -> pd.DataFrame:
+    encodings = ("utf-8", "cp1252", "latin1")
+    last_error: Exception | None = None
+    for encoding in encodings:
+        try:
+            return pd.read_csv(csv_path, low_memory=False, encoding=encoding)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    return pd.read_csv(csv_path, low_memory=False)
+
+
 def load_cicids_frame(inputs: list[str | Path]) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for csv_path in resolve_csv_paths(inputs):
-        frame = pd.read_csv(csv_path, low_memory=False)
+        frame = read_cicids_csv(csv_path)
         frame["source_file"] = csv_path.name
         frames.append(frame)
     return pd.concat(frames, ignore_index=True, sort=False)
@@ -90,6 +105,57 @@ def fill_numeric(frame: pd.DataFrame, medians: pd.Series | None = None) -> tuple
     stats = medians if medians is not None else cleaned.median(numeric_only=True)
     cleaned = cleaned.fillna(stats).fillna(0.0)
     return cleaned.astype(float), stats
+
+
+def cap_split_rows(
+    frame: pd.DataFrame,
+    max_rows: int | None,
+    random_state: int,
+    *,
+    keep_all_attacks: bool = True,
+) -> pd.DataFrame:
+    if max_rows is None or max_rows <= 0 or len(frame) <= max_rows:
+        return frame.reset_index(drop=True)
+
+    attack_rows = frame[frame["benchmark_label"] == 1]
+    benign_rows = frame[frame["benchmark_label"] == 0]
+
+    if attack_rows.empty or benign_rows.empty:
+        sampled = frame.sample(n=max_rows, random_state=random_state)
+    else:
+        min_class_rows = max(1, int(max_rows * 0.10)) if max_rows >= 10 else 1
+        attack_target = int(round(max_rows * len(attack_rows) / len(frame)))
+        attack_target = max(1, min(attack_target, max_rows - 1))
+        benign_target = max_rows - attack_target
+
+        if keep_all_attacks and len(attack_rows) <= max_rows - min_class_rows:
+            attack_target = len(attack_rows)
+            benign_target = max_rows - attack_target
+        else:
+            if len(attack_rows) >= min_class_rows and attack_target < min_class_rows:
+                attack_target = min_class_rows
+                benign_target = max_rows - attack_target
+            if len(benign_rows) >= min_class_rows and benign_target < min_class_rows:
+                benign_target = min_class_rows
+                attack_target = max_rows - benign_target
+
+        attack_target = min(len(attack_rows), attack_target)
+        benign_target = min(len(benign_rows), benign_target)
+
+        sampled_attack = attack_rows if len(attack_rows) <= attack_target else attack_rows.sample(n=attack_target, random_state=random_state)
+        sampled_benign = benign_rows if len(benign_rows) <= benign_target else benign_rows.sample(n=benign_target, random_state=random_state)
+        sampled = pd.concat([sampled_attack, sampled_benign], axis=0)
+
+        if len(sampled) < max_rows:
+            remainder = frame.drop(index=sampled.index, errors="ignore")
+            extra = min(max_rows - len(sampled), len(remainder))
+            if extra > 0:
+                sampled = pd.concat([sampled, remainder.sample(n=extra, random_state=random_state)], axis=0)
+
+    sort_cols = ["event_order"]
+    if "timestamp" in sampled.columns:
+        sort_cols = ["timestamp", "event_order"]
+    return sampled.sort_values(sort_cols).reset_index(drop=True)
 
 
 def build_temporal_splits(frame: pd.DataFrame, train_frac: float = 0.6, validation_frac: float = 0.2) -> dict[str, pd.DataFrame]:
@@ -215,6 +281,8 @@ def write_markdown_report(report: dict[str, Any], output_path: Path) -> None:
         f"- Train rows: {dataset['splits']['train_rows']}",
         f"- Validation rows: {dataset['splits']['validation_rows']}",
         f"- Test rows: {dataset['splits']['test_rows']}",
+        f"- Train cap: {dataset['sampling']['max_train_rows'] if dataset['sampling']['max_train_rows'] is not None else 'full'}",
+        f"- Validation/Test cap: {dataset['sampling']['max_eval_rows'] if dataset['sampling']['max_eval_rows'] is not None else 'full'}",
         "",
         "## Test Metrics",
         "",
@@ -236,12 +304,19 @@ def run_benchmark(
     report_path: str | Path = DEFAULT_REPORT_PATH,
     markdown_path: str | Path | None = DEFAULT_MARKDOWN_PATH,
     random_state: int = 42,
+    max_train_rows: int | None = DEFAULT_MAX_TRAIN_ROWS,
+    max_eval_rows: int | None = DEFAULT_MAX_EVAL_ROWS,
 ) -> dict[str, Any]:
     raw_frame = load_cicids_frame(inputs)
     normalized_frame = normalize_cicids_frame(raw_frame)
     numeric_features, feature_cols = select_numeric_features(normalized_frame)
     dataset = normalized_frame[["label", "benchmark_label", "timestamp", "source_file", "event_order"]].join(numeric_features)
     splits = build_temporal_splits(dataset)
+    splits = {
+        "train": cap_split_rows(splits["train"], max_train_rows, random_state, keep_all_attacks=True),
+        "validation": cap_split_rows(splits["validation"], max_eval_rows, random_state, keep_all_attacks=True),
+        "test": cap_split_rows(splits["test"], max_eval_rows, random_state, keep_all_attacks=True),
+    }
 
     iforest_bundle = fit_iforest(splits["train"], feature_cols, random_state=random_state)
     rf_bundle = fit_random_forest(splits["train"], feature_cols, random_state=random_state)
@@ -276,6 +351,10 @@ def run_benchmark(
                 "validation_rows": int(len(splits["validation"])),
                 "test_rows": int(len(splits["test"])),
             },
+            "sampling": {
+                "max_train_rows": None if max_train_rows is None else int(max_train_rows),
+                "max_eval_rows": None if max_eval_rows is None else int(max_eval_rows),
+            },
         },
         "feature_count": int(len(feature_cols)),
         "feature_sample": feature_cols[:12],
@@ -306,6 +385,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report-path", default=str(DEFAULT_REPORT_PATH), help="JSON output path")
     parser.add_argument("--markdown-path", default=str(DEFAULT_MARKDOWN_PATH), help="Markdown summary path")
     parser.add_argument("--random-state", type=int, default=42, help="Random seed for benchmark reproducibility")
+    parser.add_argument("--max-train-rows", type=int, default=DEFAULT_MAX_TRAIN_ROWS, help="Cap train split rows for resource-safe benchmarking")
+    parser.add_argument("--max-eval-rows", type=int, default=DEFAULT_MAX_EVAL_ROWS, help="Cap validation/test rows for resource-safe benchmarking")
     return parser
 
 
@@ -316,6 +397,8 @@ def main() -> dict[str, Any]:
         report_path=args.report_path,
         markdown_path=args.markdown_path,
         random_state=args.random_state,
+        max_train_rows=args.max_train_rows,
+        max_eval_rows=args.max_eval_rows,
     )
     print(json.dumps({
         "report_path": str(args.report_path),

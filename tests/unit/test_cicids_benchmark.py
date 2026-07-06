@@ -7,6 +7,8 @@ import pandas as pd
 
 from src.ml.cicids_benchmark import (
     build_temporal_splits,
+    cap_split_rows,
+    load_cicids_frame,
     normalize_cicids_frame,
     resolve_csv_paths,
     run_benchmark,
@@ -68,6 +70,33 @@ def test_build_temporal_splits_preserves_order():
     assert len(feature_cols) >= 4
 
 
+def test_cap_split_rows_preserves_attacks_under_cap():
+    normalized = normalize_cicids_frame(build_fixture_frame())
+
+    capped = cap_split_rows(normalized, max_rows=8, random_state=7)
+
+    assert len(capped) == 8
+    assert capped["benchmark_label"].sum() == normalized["benchmark_label"].sum()
+    assert capped["timestamp"].is_monotonic_increasing
+
+
+def test_load_cicids_frame_falls_back_to_cp1252(tmp_path):
+    csv_path = tmp_path / "encoded.csv"
+    csv_path.write_bytes(
+        (
+            " Timestamp, Flow Duration, Total Fwd Packets, Total Backward Packets, Flow Bytes/s, Flow Packets/s, Packet Length Mean, Label, Comment\n"
+            "2026-01-01T00:00:00Z,100,1,1,10,1,100,BENIGN,normal\n"
+            "2026-01-01T00:01:00Z,200,2,2,20,2,200,DoS Hulk,ataque\u2013ddos\n"
+        ).encode("cp1252")
+    )
+
+    frame = load_cicids_frame([csv_path])
+
+    assert len(frame) == 2
+    assert frame["source_file"].iloc[0] == "encoded.csv"
+    assert " Comment" in frame.columns
+
+
 def test_run_benchmark_writes_report_and_markdown(tmp_path):
     csv_path = tmp_path / "cicids_sample.csv"
     build_fixture_frame().to_csv(csv_path, index=False)
@@ -80,5 +109,6 @@ def test_run_benchmark_writes_report_and_markdown(tmp_path):
     assert markdown_path.exists()
     persisted = json.loads(report_path.read_text(encoding="utf-8"))
     assert persisted["dataset"]["total_rows"] == 30
+    assert persisted["dataset"]["sampling"]["max_train_rows"] == 60000
     assert persisted["models"]["ensemble"]["test"]["f1_score"] >= 0.5
     assert persisted["models"]["iforest"]["test"]["roc_auc"] >= 0.5

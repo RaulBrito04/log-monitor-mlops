@@ -4,67 +4,60 @@
 
 Adicionar uma validacao externa do metodo de deteccao sem fingir que o dataset publico usa o mesmo formato da pipeline operacional HTTP.
 
-O benchmark implementado nesta branch:
+## Estado final
 
-- carrega CSVs estilo CICIDS-2017 a partir de um ficheiro ou diretorio
+Semana fechada com benchmark real executado localmente sobre o CICIDS-2017 extraido em `data/cicids/TrafficLabelling_`.
+
+Run usado para fechar esta semana:
+
+```bash
+bash scripts/run_cicids_benchmark.sh data/cicids/TrafficLabelling_
+```
+
+Resultado operacional do run:
+
+- 5 ficheiros benchmarkados com sucesso
+- 3 ficheiros excluidos pelo proprio protocolo temporal do benchmark
+- resumo final guardado em `docs/CICIDS_BENCHMARK_RESULTS.md`
+- artefactos detalhados por ficheiro guardados em `experiments/cicids/`
+- logs de execucao guardados em `experiments/cicids/logs/`
+
+## O que este benchmark faz
+
+- carrega CSVs estilo CICIDS-2017 um a um
 - normaliza colunas e labels (`BENIGN` -> 0, resto -> 1)
 - faz split temporal `train / validation / test`
-- treina um `IsolationForest` novelty-style apenas com benign no treino
-- treina um `RandomForest` supervisionado no mesmo benchmark
+- aplica cap de recursos (`60000` rows no treino, `40000` em validation/test)
+- treina `IsolationForest` novelty-style apenas com benign no treino
+- treina `RandomForest` supervisionado no mesmo benchmark
 - avalia tambem um ensemble simples `0.5 * IF + 0.5 * RF`
 - escreve resultados em JSON e Markdown
+- regista ficheiros excluidos com razao explicita
 
 ## Porque isto e separado da pipeline operacional
 
 A pipeline do projeto e baseada em logs HTTP estruturados e features operacionais (`status_code`, `response_time_ms`, `endpoint_entropy`, etc.).
 
-O CICIDS-2017 e um dataset flow-based de IDS. Por isso, este benchmark valida a **familia de metodos de deteccao** do projeto, mas **nao substitui** a validacao operacional com logs reais Nginx/Apache que ja foi fechada.
+O CICIDS-2017 e um dataset flow-based de IDS. Por isso, este benchmark valida a **familia de metodos de deteccao** do projeto, mas **nao substitui** a validacao operacional com logs reais Nginx/Apache ja feita noutra fase.
 
-## Como correr
+## Leitura rapida dos resultados
 
-Coloca os CSVs do CICIDS-2017 numa pasta local, por exemplo:
+- o `IsolationForest` teve comportamento muito variavel entre cenarios
+- `PortScan` foi o melhor caso nao-degenerado para o `IsolationForest` (`F1 ~= 0.79`)
+- `Friday Morning` foi um caso fraco para o `IsolationForest` (`F1 ~= 0.03`), coerente com o baixo volume de ataques e a dificuldade do protocolo temporal nesse ficheiro
+- `WebAttacks` deu `F1 = 1.0`, mas com `ROC-AUC = nan` porque o split de teste ficou apenas com positivos; isto deve ser tratado como resultado parcial, nao como prova absoluta de generalizacao
+- o ensemble foi forte onde havia sinal supervisionado suficiente, mas isso nao invalida a necessidade de manter o `IsolationForest` como mecanismo para anomalias desconhecidas
 
-```bash
-mkdir -p data/cicids
-# copiar CSVs para data/cicids/
-```
+## Ficheiros excluidos e porquê
 
-Depois corre com o runner preparado nesta branch:
+- `Monday-WorkingHours`: sem mistura suficiente de benign + ataque no treino temporal
+- `Thursday-WorkingHours-Afternoon-Infilteration`: validation/test sem ataques suficientes no protocolo temporal
+- `Tuesday-WorkingHours`: validation/test sem ataques suficientes no protocolo temporal
 
-```bash
-bash scripts/run_cicids_benchmark.sh data/cicids
-```
+## Ficheiros principais desta semana
 
-Se preferires, tambem podes chamar o modulo diretamente:
-
-```bash
-./venv/bin/python -m src.ml.cicids_benchmark \
-  --input data/cicids \
-  --report-path experiments/cicids_benchmark_report.json \
-  --markdown-path experiments/cicids_benchmark_report.md
-```
-
-Tambem podes apontar diretamente para um CSV:
-
-```bash
-bash scripts/run_cicids_benchmark.sh data/cicids/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv
-```
-
-## Outputs
-
-- `experiments/cicids_benchmark_report.json`
-- `experiments/cicids_benchmark_report.md`
-
-## O que ainda falta para fechar esta semana totalmente
-
-- correr o benchmark com o dataset real localmente
-- guardar os resultados finais do run
-- comparar metricas com os resultados internos/sinteticos no relatorio
-## Estado atual desta branch
-
-- harness do benchmark implementado
-- testes unitarios do benchmark a verde
-- runner `scripts/run_cicids_benchmark.sh` smoke-tested com fixture temporario
-- execucao com o dataset CICIDS-2017 real ainda pendente por ausencia dos CSVs nesta maquina
-
-
+- `src/ml/cicids_benchmark.py`
+- `scripts/run_cicids_benchmark.sh`
+- `tests/unit/test_cicids_benchmark.py`
+- `docs/CICIDS_BENCHMARK_RESULTS.md`
+- `docs/CICIDS_BENCHMARK_METHOD.md`
