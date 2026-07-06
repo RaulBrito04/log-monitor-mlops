@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import psycopg2
-from prometheus_client import Gauge, Histogram, Info
+from prometheus_client import Counter, Gauge, Histogram, Info
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_METRICS_FILE = PROJECT_ROOT / "data" / "runtime_metrics.json"
@@ -17,6 +18,37 @@ DB_QUERY_DURATION = Histogram(
     "Database query duration for monitoring collectors",
     ["query_type"],
     buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5),
+)
+
+PIPELINE_STAGE_DURATION = Histogram(
+    "logmonitor_pipeline_stage_duration_seconds",
+    "Observed execution time for ingestion, rule-engine, and hybrid pipeline stages",
+    ["component", "stage"],
+    buckets=(0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+)
+
+PIPELINE_STAGE_BATCH_SIZE = Gauge(
+    "logmonitor_pipeline_stage_batch_size",
+    "Latest batch size observed for a pipeline stage",
+    ["component", "stage"],
+)
+
+PIPELINE_STAGE_ROW_COUNT = Gauge(
+    "logmonitor_pipeline_stage_row_count",
+    "Latest processed row count observed for a pipeline stage",
+    ["component", "stage"],
+)
+
+PIPELINE_STAGE_ERRORS_TOTAL = Counter(
+    "logmonitor_pipeline_stage_errors_total",
+    "Total observed errors for a pipeline stage",
+    ["component", "stage"],
+)
+
+PIPELINE_COMPONENT_THROUGHPUT = Gauge(
+    "logmonitor_pipeline_component_throughput_logs_per_second",
+    "Latest measured throughput in logs per second for an instrumented component",
+    ["component"],
 )
 
 ALERTS_TOTAL = Gauge(
@@ -128,7 +160,7 @@ def _load_runtime_metrics() -> dict[str, Any]:
     if not RUNTIME_METRICS_FILE.exists():
         return {}
     try:
-        return json.loads(RUNTIME_METRICS_FILE.read_text(encoding="utf-8"))
+        return json.loads(RUNTIME_METRICS_FILE.read_text(encoding="utf-8-sig"))
     except Exception:
         return {}
 
@@ -138,6 +170,49 @@ def persist_runtime_metrics(payload: dict[str, Any]) -> dict[str, Any]:
     current = _load_runtime_metrics()
     current.update(payload)
     RUNTIME_METRICS_FILE.write_text(json.dumps(current, indent=2), encoding="utf-8")
+    return current
+
+
+def observe_pipeline_stage(
+    component: str,
+    stage: str,
+    duration_seconds: float,
+    *,
+    batch_size: int | None = None,
+    row_count: int | None = None,
+    error_count: int = 0,
+) -> None:
+    duration_value = max(float(duration_seconds), 0.0)
+    PIPELINE_STAGE_DURATION.labels(component=component, stage=stage).observe(duration_value)
+    if batch_size is not None:
+        PIPELINE_STAGE_BATCH_SIZE.labels(component=component, stage=stage).set(int(batch_size))
+    if row_count is not None:
+        PIPELINE_STAGE_ROW_COUNT.labels(component=component, stage=stage).set(int(row_count))
+    if error_count > 0:
+        PIPELINE_STAGE_ERRORS_TOTAL.labels(component=component, stage=stage).inc(int(error_count))
+
+
+def persist_component_runtime_metrics(component: str, payload: dict[str, Any]) -> dict[str, Any]:
+    RUNTIME_METRICS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    current = _load_runtime_metrics()
+    throughput_components = current.get("throughput_components")
+    if not isinstance(throughput_components, dict):
+        throughput_components = {}
+    snapshot = {
+        "component": component,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        **payload,
+    }
+    throughput_components[component] = snapshot
+    current["throughput_components"] = throughput_components
+    RUNTIME_METRICS_FILE.write_text(json.dumps(current, indent=2), encoding="utf-8")
+
+    throughput_value = snapshot.get("throughput_logs_per_second")
+    if throughput_value is not None:
+        try:
+            PIPELINE_COMPONENT_THROUGHPUT.labels(component=component).set(float(throughput_value))
+        except (TypeError, ValueError):
+            pass
     return current
 
 
@@ -151,6 +226,7 @@ def refresh_monitoring_metrics(force: bool = False) -> None:
     ACTIVE_ALERTS.clear()
     INCIDENT_ALERTS_TOTAL.clear()
     ML_PREDICTIONS_TOTAL.clear()
+    PIPELINE_COMPONENT_THROUGHPUT.clear()
 
     try:
         conn = psycopg2.connect(**_db_config())
@@ -226,6 +302,18 @@ def refresh_monitoring_metrics(force: bool = False) -> None:
         return
 
     runtime_metrics = _load_runtime_metrics()
+    throughput_components = runtime_metrics.get("throughput_components", {})
+    if isinstance(throughput_components, dict):
+        for component, snapshot in throughput_components.items():
+            if not isinstance(snapshot, dict):
+                continue
+            throughput_value = snapshot.get("throughput_logs_per_second")
+            if throughput_value is None:
+                continue
+            try:
+                PIPELINE_COMPONENT_THROUGHPUT.labels(component=component).set(float(throughput_value))
+            except (TypeError, ValueError):
+                continue
     f1_value = float(runtime_metrics.get("ml_f1_score", 0.0) or 0.0)
     model_name = str(runtime_metrics.get("model", "hybrid_ensemble"))
     dataset_name = str(runtime_metrics.get("dataset", "holdout"))

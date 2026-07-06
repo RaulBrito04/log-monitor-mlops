@@ -1,4 +1,4 @@
-"""
+﻿"""
 Log ingestion pipeline: reads logs and inserts them into PostgreSQL.
 
 Usage:
@@ -14,11 +14,18 @@ import re
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import psycopg2
-from psycopg2.extras import execute_values
 from dotenv import load_dotenv
+from psycopg2.extras import execute_values
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.monitoring.metrics import observe_pipeline_stage, persist_component_runtime_metrics
 
 load_dotenv()
 
@@ -220,8 +227,39 @@ def insert_logs_batch(cursor, logs: list[dict]):
         ) VALUES %s
     """
 
+    prepare_started = time.perf_counter()
     data = [prepare_log_for_insert(log) for log in logs]
-    execute_values(cursor, query, data, page_size=len(data))
+    prepare_duration = time.perf_counter() - prepare_started
+    observe_pipeline_stage(
+        "ingester",
+        "prepare_insert",
+        prepare_duration,
+        batch_size=len(data),
+        row_count=len(data),
+    )
+
+    execute_started = time.perf_counter()
+    try:
+        execute_values(cursor, query, data, page_size=len(data))
+    except Exception:
+        observe_pipeline_stage(
+            "ingester",
+            "execute_values",
+            time.perf_counter() - execute_started,
+            batch_size=len(data),
+            row_count=0,
+            error_count=1,
+        )
+        raise
+
+    execute_duration = time.perf_counter() - execute_started
+    observe_pipeline_stage(
+        "ingester",
+        "execute_values",
+        execute_duration,
+        batch_size=len(data),
+        row_count=len(data),
+    )
     return len(data)
 
 
@@ -239,15 +277,77 @@ def ingest_from_file(filepath: str, batch_size: int = 100, log_format: str = "js
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    batch = []
+    batch: list[dict] = []
     total_ingested = 0
     total_failed = 0
-    start_time = time.time()
+    total_lines = 0
+    batch_parse_duration = 0.0
+    batch_lines_seen = 0
+    start_time = time.perf_counter()
+
+    def flush_batch(reason: str):
+        nonlocal batch, total_ingested, total_failed, batch_parse_duration, batch_lines_seen
+        if not batch:
+            return
+
+        observe_pipeline_stage(
+            "ingester",
+            "parse_batch",
+            batch_parse_duration,
+            batch_size=len(batch),
+            row_count=batch_lines_seen,
+        )
+
+        insert_started = time.perf_counter()
+        try:
+            inserted = insert_logs_batch(cursor, batch)
+            insert_duration = time.perf_counter() - insert_started
+            observe_pipeline_stage(
+                "ingester",
+                "insert_batch_total",
+                insert_duration,
+                batch_size=len(batch),
+                row_count=inserted,
+            )
+
+            commit_started = time.perf_counter()
+            conn.commit()
+            commit_duration = time.perf_counter() - commit_started
+            observe_pipeline_stage(
+                "ingester",
+                "commit_batch",
+                commit_duration,
+                batch_size=len(batch),
+                row_count=inserted,
+            )
+
+            total_ingested += inserted
+            print(f"✓ Ingested {total_ingested} logs ({reason})")
+        except Exception as exc:
+            conn.rollback()
+            observe_pipeline_stage(
+                "ingester",
+                "insert_batch_total",
+                time.perf_counter() - insert_started,
+                batch_size=len(batch),
+                row_count=0,
+                error_count=1,
+            )
+            print(f"ERROR inserting batch ({reason}): {exc}")
+            total_failed += len(batch)
+        finally:
+            batch = []
+            batch_parse_duration = 0.0
+            batch_lines_seen = 0
 
     try:
         with open(filepath, "r", encoding="utf-8") as handle:
             for line_num, line in enumerate(handle, 1):
+                total_lines += 1
+                parse_started = time.perf_counter()
                 log = parse_log_line(line, log_format=log_format)
+                batch_parse_duration += time.perf_counter() - parse_started
+                batch_lines_seen += 1
 
                 if log:
                     batch.append(log)
@@ -255,31 +355,27 @@ def ingest_from_file(filepath: str, batch_size: int = 100, log_format: str = "js
                     total_failed += 1
 
                 if len(batch) >= batch_size:
-                    try:
-                        inserted = insert_logs_batch(cursor, batch)
-                        conn.commit()
-                        total_ingested += inserted
-                        print(f"✓ Ingested {total_ingested} logs (line {line_num})")
-                    except Exception as exc:
-                        conn.rollback()
-                        print(f"ERROR inserting batch at line {line_num}: {exc}")
-                        total_failed += len(batch)
-                    finally:
-                        batch = []
+                    flush_batch(f"line {line_num}")
 
         if batch:
-            try:
-                inserted = insert_logs_batch(cursor, batch)
-                conn.commit()
-                total_ingested += inserted
-                print(f"✓ Ingested {total_ingested} logs (final batch)")
-            except Exception as exc:
-                conn.rollback()
-                print(f"ERROR inserting final batch: {exc}")
-                total_failed += len(batch)
+            flush_batch("final batch")
 
-        elapsed = time.time() - start_time
-        rate = total_ingested / elapsed if elapsed > 0 else 0
+        elapsed = time.perf_counter() - start_time
+        rate = total_ingested / elapsed if elapsed > 0 else 0.0
+
+        persist_component_runtime_metrics(
+            "ingester",
+            {
+                "source_file": filepath,
+                "log_format": log_format,
+                "configured_batch_size": batch_size,
+                "lines_read": total_lines,
+                "logs_ingested": total_ingested,
+                "failed_records": total_failed,
+                "duration_seconds": round(elapsed, 6),
+                "throughput_logs_per_second": round(rate, 6),
+            },
+        )
 
         print("\n" + "=" * 50)
         print("INGESTION COMPLETE")

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Rule Engine - Detecao baseada em regras SQL
 6 regras: brute force, sql injection, port scanning,
           path traversal, suspicious user agent, time-based anomaly
@@ -14,12 +14,21 @@ Uso:
   python src/detection/rule_engine.py --mode realtime --interval 30
 """
 
-import psycopg2
-import os
-import time
 import argparse
+import os
+import sys
+import time
 from datetime import datetime
+from pathlib import Path
+
+import psycopg2
 from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.monitoring.metrics import observe_pipeline_stage, persist_component_runtime_metrics
 
 load_dotenv()
 
@@ -30,10 +39,6 @@ def get_rules(window):
     window: string PostgreSQL interval, ex: '60 seconds' ou '7 days'
     """
     return [
-        # ------------------------------------------------------------------
-        # REGRA 1: Brute Force
-        # Deteta IPs com >= 5 login failures na janela
-        # ------------------------------------------------------------------
         (
             "Brute Force Detection",
             """
@@ -58,12 +63,8 @@ def get_rules(window):
               AND timestamp > NOW() - INTERVAL '{window}'
             GROUP BY ip
             HAVING COUNT(*) >= 5;
-            """.replace("{window}", window)
+            """.replace("{window}", window),
         ),
-        # ------------------------------------------------------------------
-        # REGRA 2: SQL Injection
-        # Deteta padroes de SQL injection em endpoints
-        # ------------------------------------------------------------------
         (
             "SQL Injection Detection",
             """
@@ -90,12 +91,8 @@ def get_rules(window):
               )
             GROUP BY ip, endpoint, method
             HAVING COUNT(*) >= 1;
-            """.replace("{window}", window)
+            """.replace("{window}", window),
         ),
-        # ------------------------------------------------------------------
-        # REGRA 3: Port Scanning
-        # Deteta IPs que acedem >= 10 endpoints distintos na janela
-        # ------------------------------------------------------------------
         (
             "Port Scanning Detection",
             """
@@ -118,12 +115,8 @@ def get_rules(window):
             WHERE timestamp > NOW() - INTERVAL '{window}'
             GROUP BY ip
             HAVING COUNT(DISTINCT endpoint) >= 10;
-            """.replace("{window}", window)
+            """.replace("{window}", window),
         ),
-        # ------------------------------------------------------------------
-        # REGRA 4: Path Traversal
-        # Deteta tentativas de aceder ficheiros do sistema via ../
-        # ------------------------------------------------------------------
         (
             "Path Traversal Detection",
             """
@@ -140,7 +133,7 @@ def get_rules(window):
                     'method',    method,
                     'attempts',  COUNT(*),
                     'pattern',   CASE
-                        WHEN endpoint ILIKE '%../%'        THEN 'directory traversal'
+                        WHEN endpoint ILIKE '%../%'         THEN 'directory traversal'
                         WHEN endpoint ILIKE '%/etc/passwd%' THEN 'passwd file access'
                         WHEN endpoint ILIKE '%/etc/shadow%' THEN 'shadow file access'
                         WHEN endpoint ILIKE '%/proc/%'      THEN 'proc filesystem access'
@@ -158,12 +151,8 @@ def get_rules(window):
               )
             GROUP BY ip, endpoint, method
             HAVING COUNT(*) >= 1;
-            """.replace("{window}", window)
+            """.replace("{window}", window),
         ),
-        # ------------------------------------------------------------------
-        # REGRA 5: Suspicious User Agent
-        # Deteta ferramentas de scanning/exploitation conhecidas
-        # ------------------------------------------------------------------
         (
             "Suspicious User Agent",
             """
@@ -194,13 +183,8 @@ def get_rules(window):
               )
             GROUP BY ip, data->>'user_agent'
             HAVING COUNT(*) >= 3;
-            """.replace("{window}", window)
+            """.replace("{window}", window),
         ),
-        # ------------------------------------------------------------------
-        # REGRA 6: Time-Based Anomaly
-        # Deteta acessos fora do horario de negocio (22h-6h)
-        # com volume elevado (>= 20 requests)
-        # ------------------------------------------------------------------
         (
             "Time-Based Anomaly",
             """
@@ -227,22 +211,56 @@ def get_rules(window):
               )
             GROUP BY ip
             HAVING COUNT(*) >= 20;
-            """.replace("{window}", window)
+            """.replace("{window}", window),
         ),
     ]
 
 
+def _stage_name(rule_name: str) -> str:
+    return rule_name.lower().replace(" ", "_")
+
+
 def execute_rule(cursor, rule_name, sql_query):
+    started = time.perf_counter()
+    stage_name = _stage_name(rule_name)
     try:
-        start = datetime.now()
         cursor.execute(sql_query)
-        count = cursor.rowcount
-        ms = (datetime.now() - start).total_seconds() * 1000
-        print(f"  OK  {rule_name:<30} {count} alertas  ({ms:.1f}ms)")
-        return count
-    except Exception as e:
-        print(f"  ERRO {rule_name}: {e}")
-        return 0
+        count = max(cursor.rowcount, 0)
+    except Exception as exc:
+        duration = time.perf_counter() - started
+        observe_pipeline_stage(
+            "rule_engine",
+            stage_name,
+            duration,
+            batch_size=1,
+            row_count=0,
+            error_count=1,
+        )
+        print(f"  ERRO {rule_name}: {exc}")
+        return {
+            "rule_name": rule_name,
+            "stage": stage_name,
+            "alerts_created": 0,
+            "duration_seconds": round(duration, 6),
+            "error": str(exc),
+        }
+
+    duration = time.perf_counter() - started
+    observe_pipeline_stage(
+        "rule_engine",
+        stage_name,
+        duration,
+        batch_size=1,
+        row_count=count,
+    )
+    print(f"  OK  {rule_name:<30} {count} alertas  ({duration * 1000:.1f}ms)")
+    return {
+        "rule_name": rule_name,
+        "stage": stage_name,
+        "alerts_created": count,
+        "duration_seconds": round(duration, 6),
+        "error": None,
+    }
 
 
 def run_once(cursor, window, label):
@@ -251,13 +269,34 @@ def run_once(cursor, window, label):
     print(f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'=' * 60}")
 
+    cycle_started = time.perf_counter()
+    rule_metrics = []
     total = 0
     for name, sql in get_rules(window):
-        total += execute_rule(cursor, name, sql)
+        rule_result = execute_rule(cursor, name, sql)
+        rule_metrics.append(rule_result)
+        total += rule_result["alerts_created"]
+
+    rules_duration = time.perf_counter() - cycle_started
+    observe_pipeline_stage(
+        "rule_engine",
+        "rules_cycle",
+        rules_duration,
+        batch_size=len(rule_metrics),
+        row_count=total,
+    )
 
     print(f"\n  Total de alertas criados: {total}")
     print(f"{'=' * 60}\n")
-    return total
+    return {
+        "window": window,
+        "label": label,
+        "alerts_created": total,
+        "rules_executed": len(rule_metrics),
+        "rules_duration_seconds": round(rules_duration, 6),
+        "error_count": sum(1 for item in rule_metrics if item["error"]),
+        "per_rule": rule_metrics,
+    }
 
 
 def connect():
@@ -266,7 +305,33 @@ def connect():
         port=int(os.getenv("POSTGRES_PORT", "5432")),
         database=os.getenv("POSTGRES_DB", "logmonitor"),
         user=os.getenv("POSTGRES_USER", "postgres"),
-        password=os.getenv("POSTGRES_PASSWORD", "changeme")
+        password=os.getenv("POSTGRES_PASSWORD", "changeme"),
+    )
+
+
+def _finalize_cycle(summary, commit_duration):
+    total_duration = summary["rules_duration_seconds"] + commit_duration
+    observe_pipeline_stage(
+        "rule_engine",
+        "commit_cycle",
+        commit_duration,
+        batch_size=summary["rules_executed"],
+        row_count=summary["alerts_created"],
+    )
+    observe_pipeline_stage(
+        "rule_engine",
+        "cycle_total",
+        total_duration,
+        batch_size=summary["rules_executed"],
+        row_count=summary["alerts_created"],
+    )
+    persist_component_runtime_metrics(
+        "rule_engine",
+        {
+            **summary,
+            "commit_duration_seconds": round(commit_duration, 6),
+            "duration_seconds": round(total_duration, 6),
+        },
     )
 
 
@@ -275,8 +340,10 @@ def mode_historical(days):
     print(f"\nModo HISTORICAL -- analisando ultimos {days} dias")
     conn = connect()
     cursor = conn.cursor()
-    run_once(cursor, f"{days} days", "HISTORICAL")
+    summary = run_once(cursor, f"{days} days", "HISTORICAL")
+    commit_started = time.perf_counter()
     conn.commit()
+    _finalize_cycle(summary, time.perf_counter() - commit_started)
     cursor.close()
     conn.close()
     print("Analise historica concluida.")
@@ -290,8 +357,10 @@ def mode_realtime(interval_seconds):
     cursor = conn.cursor()
     try:
         while True:
-            run_once(cursor, "60 seconds", "REALTIME")
+            summary = run_once(cursor, "60 seconds", "REALTIME")
+            commit_started = time.perf_counter()
             conn.commit()
+            _finalize_cycle(summary, time.perf_counter() - commit_started)
             time.sleep(interval_seconds)
     except KeyboardInterrupt:
         print("\nParado pelo utilizador.")
@@ -306,19 +375,19 @@ if __name__ == "__main__":
         "--mode",
         choices=["historical", "realtime"],
         required=True,
-        help="historical: analisa historico uma vez | realtime: loop continuo"
+        help="historical: analisa historico uma vez | realtime: loop continuo",
     )
     parser.add_argument(
         "--days",
         type=int,
         default=7,
-        help="Dias a analisar no modo historical (default: 7)"
+        help="Dias a analisar no modo historical (default: 7)",
     )
     parser.add_argument(
         "--interval",
         type=int,
         default=60,
-        help="Segundos entre ciclos no modo realtime (default: 60)"
+        help="Segundos entre ciclos no modo realtime (default: 60)",
     )
     args = parser.parse_args()
 

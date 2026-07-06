@@ -138,6 +138,7 @@ class TestBatchInsert:
         conn = mocker.Mock()
         conn.cursor.return_value = cursor
         mocker.patch("src.log_processor.ingester.get_db_connection", return_value=conn)
+        mocker.patch("src.log_processor.ingester.persist_component_runtime_metrics")
         insert_batch = mocker.patch(
             "src.log_processor.ingester.insert_logs_batch",
             side_effect=lambda _cursor, batch: len(batch),
@@ -165,6 +166,7 @@ class TestBatchInsert:
         conn = mocker.Mock()
         conn.cursor.return_value = cursor
         mocker.patch("src.log_processor.ingester.get_db_connection", return_value=conn)
+        mocker.patch("src.log_processor.ingester.persist_component_runtime_metrics")
         insert_batch = mocker.patch(
             "src.log_processor.ingester.insert_logs_batch",
             side_effect=lambda _cursor, batch: len(batch),

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Hybrid Detection Pipeline - Semana 7
 Combina Rule Engine (Semana 4) com Isolation Forest (Semana 6)
@@ -6,16 +6,22 @@ Combina Rule Engine (Semana 4) com Isolation Forest (Semana 6)
 
 from __future__ import annotations
 
-import json
 import os
 import pickle  # nosec B403
-from datetime import datetime
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import psycopg2
 from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.monitoring.metrics import observe_pipeline_stage, persist_component_runtime_metrics
 
 load_dotenv()
 
@@ -69,6 +75,7 @@ class HybridPipeline:
         self.model = bundle["model"]
         self.scaler = bundle["scaler"]
         self.scaler_path = scaler_path
+        self.last_batch_summary: dict[str, object] | None = None
 
         with open(features_path, encoding="utf-8") as handle:
             self.feature_cols = [line.strip() for line in handle if line.strip()]
@@ -87,18 +94,40 @@ class HybridPipeline:
         print(f"  Features esperadas: {len(self.feature_cols)}")
 
     def get_rule_score(self, log_id: int):
+        started = time.perf_counter()
         cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            SELECT alert_type, severity
-            FROM alerts
-            WHERE %s = ANY(log_ids)
-            ORDER BY severity DESC
-            """,
-            (log_id,),
+        try:
+            cursor.execute(
+                """
+                SELECT alert_type, severity
+                FROM alerts
+                WHERE %s = ANY(log_ids)
+                ORDER BY severity DESC
+                """,
+                (log_id,),
+            )
+            rows = cursor.fetchall()
+        except Exception:
+            observe_pipeline_stage(
+                "hybrid_pipeline",
+                "rule_lookup",
+                time.perf_counter() - started,
+                batch_size=1,
+                row_count=0,
+                error_count=1,
+            )
+            raise
+        finally:
+            cursor.close()
+
+        duration = time.perf_counter() - started
+        observe_pipeline_stage(
+            "hybrid_pipeline",
+            "rule_lookup",
+            duration,
+            batch_size=1,
+            row_count=len(rows),
         )
-        rows = cursor.fetchall()
-        cursor.close()
 
         if not rows:
             return 0.0, []
@@ -115,14 +144,35 @@ class HybridPipeline:
         return rule_score, rule_ids
 
     def get_ml_score(self, log_features: dict):
-        row = {col: log_features.get(col, 0.0) for col in self.feature_cols}
-        x_frame = pd.DataFrame([row])
-        x_frame = x_frame.apply(pd.to_numeric, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        x_scaled = self.scaler.transform(x_frame)
-        raw_score = self.model.decision_function(x_scaled)[0]
-        raw_clamped = np.clip(raw_score, -0.5, 0.5)
-        ml_score = 1.0 - (raw_clamped + 0.5)
-        confidence = abs(ml_score - 0.5) * 2.0
+        started = time.perf_counter()
+        try:
+            row = {col: log_features.get(col, 0.0) for col in self.feature_cols}
+            x_frame = pd.DataFrame([row])
+            x_frame = x_frame.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            x_scaled = self.scaler.transform(x_frame)
+            raw_score = self.model.decision_function(x_scaled)[0]
+            raw_clamped = np.clip(raw_score, -0.5, 0.5)
+            ml_score = 1.0 - (raw_clamped + 0.5)
+            confidence = abs(ml_score - 0.5) * 2.0
+        except Exception:
+            observe_pipeline_stage(
+                "hybrid_pipeline",
+                "ml_score",
+                time.perf_counter() - started,
+                batch_size=1,
+                row_count=0,
+                error_count=1,
+            )
+            raise
+
+        duration = time.perf_counter() - started
+        observe_pipeline_stage(
+            "hybrid_pipeline",
+            "ml_score",
+            duration,
+            batch_size=1,
+            row_count=1,
+        )
         return float(ml_score), float(confidence)
 
     def combine_scores(self, rule_score: float, ml_score: float):
@@ -141,53 +191,98 @@ class HybridPipeline:
         return "NORMAL"
 
     def evaluate_log(self, log_id: int, log_features: dict):
-        rule_score, rule_ids = self.get_rule_score(log_id)
-        ml_score, ml_confidence = self.get_ml_score(log_features)
-        final_score = self.combine_scores(rule_score, ml_score)
-        severity = self.classify_severity(final_score)
+        started = time.perf_counter()
+        try:
+            rule_score, rule_ids = self.get_rule_score(log_id)
+            ml_score, ml_confidence = self.get_ml_score(log_features)
+            final_score = self.combine_scores(rule_score, ml_score)
+            severity = self.classify_severity(final_score)
 
-        result = {
-            "log_id": log_id,
-            "rule_score": rule_score,
-            "ml_score": ml_score,
-            "final_score": final_score,
-            "severity": severity,
-            "triggered_rules": rule_ids,
-            "ml_confidence": ml_confidence,
-            "is_anomaly": severity != "NORMAL",
-        }
-        self._persist(result)
+            result = {
+                "log_id": log_id,
+                "rule_score": rule_score,
+                "ml_score": ml_score,
+                "final_score": final_score,
+                "severity": severity,
+                "triggered_rules": rule_ids,
+                "ml_confidence": ml_confidence,
+                "is_anomaly": severity != "NORMAL",
+            }
+            self._persist(result)
+        except Exception:
+            observe_pipeline_stage(
+                "hybrid_pipeline",
+                "evaluate_log",
+                time.perf_counter() - started,
+                batch_size=1,
+                row_count=0,
+                error_count=1,
+            )
+            raise
+
+        duration = time.perf_counter() - started
+        observe_pipeline_stage(
+            "hybrid_pipeline",
+            "evaluate_log",
+            duration,
+            batch_size=1,
+            row_count=1,
+        )
         return result
 
     def _persist(self, result: dict):
+        started = time.perf_counter()
         cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO hybrid_scores
-                (log_id, rule_score, ml_score, final_score,
-                 severity, triggered_rules, ml_confidence, is_anomaly)
-            VALUES
-                (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING
-            """,
-            (
-                result["log_id"],
-                result["rule_score"],
-                result["ml_score"],
-                result["final_score"],
-                result["severity"],
-                result["triggered_rules"],
-                result["ml_confidence"],
-                result["is_anomaly"],
-            ),
+        try:
+            cursor.execute(
+                """
+                INSERT INTO hybrid_scores
+                    (log_id, rule_score, ml_score, final_score,
+                     severity, triggered_rules, ml_confidence, is_anomaly)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    result["log_id"],
+                    result["rule_score"],
+                    result["ml_score"],
+                    result["final_score"],
+                    result["severity"],
+                    result["triggered_rules"],
+                    result["ml_confidence"],
+                    result["is_anomaly"],
+                ),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            observe_pipeline_stage(
+                "hybrid_pipeline",
+                "persist_score",
+                time.perf_counter() - started,
+                batch_size=1,
+                row_count=0,
+                error_count=1,
+            )
+            raise
+        finally:
+            cursor.close()
+
+        duration = time.perf_counter() - started
+        observe_pipeline_stage(
+            "hybrid_pipeline",
+            "persist_score",
+            duration,
+            batch_size=1,
+            row_count=1,
         )
-        self.conn.commit()
-        cursor.close()
 
     def evaluate_batch(self, logs_df: pd.DataFrame, verbose: bool = True):
         results = []
         total = len(logs_df)
         print(f"\nAvaliando {total:,} logs...")
+        batch_started = time.perf_counter()
 
         for i, (_, row) in enumerate(logs_df.iterrows(), 1):
             log_id = int(row["id"]) if "id" in row else int(row["log_id"])
@@ -198,6 +293,34 @@ class HybridPipeline:
                 print(f"  {i:,}/{total:,} avaliados...")
 
         results_df = pd.DataFrame(results)
+        duration = time.perf_counter() - batch_started
+        throughput = total / duration if duration > 0 else 0.0
+        anomalies_found = int(results_df["is_anomaly"].sum()) if not results_df.empty else 0
+        observe_pipeline_stage(
+            "hybrid_pipeline",
+            "evaluate_batch",
+            duration,
+            batch_size=total,
+            row_count=anomalies_found,
+        )
+        self.last_batch_summary = {
+            "logs_processed": total,
+            "anomalies_found": anomalies_found,
+            "duration_seconds": round(duration, 6),
+            "throughput_logs_per_second": round(throughput, 6),
+        }
+        persist_component_runtime_metrics(
+            "hybrid_pipeline",
+            {
+                "logs_processed": total,
+                "anomalies_found": anomalies_found,
+                "duration_seconds": round(duration, 6),
+                "throughput_logs_per_second": round(throughput, 6),
+                "average_final_score": round(float(results_df["final_score"].mean()), 6) if not results_df.empty else 0.0,
+                "average_rule_score": round(float(results_df["rule_score"].mean()), 6) if not results_df.empty else 0.0,
+                "average_ml_score": round(float(results_df["ml_score"].mean()), 6) if not results_df.empty else 0.0,
+            },
+        )
         if verbose:
             print("\nBatch completo!")
             self._print_summary(results_df)
@@ -226,4 +349,3 @@ class HybridPipeline:
         print(f"  Rule score medio: {results_df['rule_score'].mean():.3f}")
         print(f"  ML score medio  : {results_df['ml_score'].mean():.3f}")
         print("=" * 60)
-
