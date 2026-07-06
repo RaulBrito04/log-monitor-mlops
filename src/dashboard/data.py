@@ -11,6 +11,7 @@ import streamlit as st
 from psycopg2.extras import RealDictCursor
 
 from src.dashboard.config import get_config
+from src.ml.lime_explainer import LimeAlertExplainer, LimeUnavailableError
 
 REQUEST_TIMEOUT_SECONDS = 5
 DEFAULT_PAGE_LIMIT = 250
@@ -161,6 +162,11 @@ def _fetch_overview_snapshot() -> dict[str, Any]:
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_overview_snapshot() -> dict[str, Any]:
     return _fetch_overview_snapshot()
+
+
+@st.cache_resource(show_spinner=False)
+def get_lime_explainer() -> LimeAlertExplainer:
+    return LimeAlertExplainer()
 
 
 def _fetch_alert_options() -> dict[str, list[str]]:
@@ -487,6 +493,80 @@ def fetch_ml_f1_history(hours: int = 24, step: str = "5m") -> pd.DataFrame:
     return _fetch_ml_f1_history(hours, step)
 
 
+def _fetch_log_context_window(log_id: int, limit: int = 250) -> list[dict[str, Any]]:
+    target_log = _one(
+        """
+        SELECT id, timestamp, ip::text AS ip
+        FROM raw_logs
+        WHERE id = %s
+        """,
+        (log_id,),
+    )
+    if not target_log:
+        return []
+
+    return _rows(
+        """
+        SELECT id, timestamp, ip::text AS ip, method, endpoint, status,
+               response_time_ms, user_agent, data
+        FROM (
+            SELECT id, timestamp, ip, method, endpoint, status,
+                   response_time_ms, user_agent, data
+            FROM raw_logs
+            WHERE timestamp <= %s
+              AND timestamp >= %s - INTERVAL '60 minutes'
+            ORDER BY timestamp DESC, id DESC
+            LIMIT %s
+        ) recent_logs
+        ORDER BY timestamp, id
+        """,
+        (target_log["timestamp"], target_log["timestamp"], limit),
+    )
+
+
+
+def _fetch_alert_explanation(alert_id: int, log_id: int | None = None, top_k: int = 8) -> dict[str, Any]:
+    detail = _fetch_alert_detail(alert_id)
+    if not detail:
+        return {"status": "unavailable", "message": f"Alert {alert_id} could not be loaded."}
+
+    available_log_ids = [int(value) for value in (detail.get("log_ids") or [])]
+    if not available_log_ids:
+        return {"status": "unavailable", "message": "No related log IDs are attached to this alert."}
+
+    target_log_id = int(log_id or available_log_ids[0])
+    if target_log_id not in available_log_ids:
+        return {
+            "status": "unavailable",
+            "message": f"Log {target_log_id} is not attached to alert {alert_id}.",
+        }
+
+    context_rows = _fetch_log_context_window(target_log_id)
+    raw_context = pd.DataFrame(context_rows) if context_rows else pd.DataFrame()
+
+    try:
+        explanation = get_lime_explainer().explain_log(
+            target_log_id,
+            raw_log_context=raw_context if not raw_context.empty else None,
+            top_k=top_k,
+        )
+    except (LimeUnavailableError, LookupError, FileNotFoundError, ValueError) as exc:
+        return {"status": "unavailable", "message": str(exc), "log_id": target_log_id}
+
+    return {
+        "status": "ok",
+        "alert_id": int(alert_id),
+        "available_log_ids": available_log_ids,
+        "context_rows": int(len(raw_context)),
+        **explanation,
+    }
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_alert_explanation(alert_id: int, log_id: int | None = None, top_k: int = 8) -> dict[str, Any]:
+    return _fetch_alert_explanation(alert_id, log_id, top_k)
+
+
 def clear_dashboard_caches() -> None:
     fetch_overview_snapshot.clear()
     fetch_alert_options.clear()
@@ -500,4 +580,6 @@ def clear_dashboard_caches() -> None:
     fetch_prediction_split.clear()
     fetch_alert_trend.clear()
     fetch_ml_f1_history.clear()
+    fetch_alert_explanation.clear()
+    get_lime_explainer.clear()
 

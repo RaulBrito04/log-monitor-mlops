@@ -15,6 +15,7 @@ iniconfig==2.3.0
 itsdangerous==2.2.0
 Jinja2==3.1.6
 locust==2.43.4
+lime==0.2.0.1
 MarkupSafe==3.0.3
 matplotlib==3.10.7
 mccabe==0.7.0

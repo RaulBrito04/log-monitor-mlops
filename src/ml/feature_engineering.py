@@ -33,11 +33,12 @@ DEFAULT_LOOKBACK_DAYS = int(os.getenv('FEATURE_LOOKBACK_DAYS', '90'))
 class FeatureEngineer:
     """Pipeline completo de feature engineering para anomaly detection"""
     
-    def __init__(self):
+    def __init__(self, connect_db=True):
         self.conn = None
         self.cursor = None
         self._setup_directories()
-        self._connect_db()
+        if connect_db:
+            self._connect_db()
     
     def _setup_directories(self):
         """Cria diretórios necessários"""
@@ -739,4 +740,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 

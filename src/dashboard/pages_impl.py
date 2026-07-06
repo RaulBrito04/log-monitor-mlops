@@ -158,6 +158,40 @@ def render_alerts_page() -> None:
             st.subheader("Related logs")
             st.dataframe(_to_frame(related_logs), use_container_width=True, hide_index=True)
 
+        st.subheader("LIME explanation")
+        available_log_ids = detail.get("log_ids") or []
+        if not available_log_ids:
+            render_empty("No related logs are available for LIME explanation.")
+        else:
+            explanation_log_id = st.selectbox(
+                "Explain related log",
+                options=available_log_ids,
+                key=f"lime-log-{detail['id']}",
+                format_func=lambda value: f"Log #{value}",
+            )
+            explanation = data.fetch_alert_explanation(int(detail["id"]), int(explanation_log_id))
+            if explanation.get("status") != "ok":
+                render_empty(explanation.get("message", "LIME explanation is unavailable for this alert."))
+            else:
+                exp1, exp2, exp3 = st.columns(3)
+                exp1.metric("RF anomaly probability", f"{explanation['anomaly_probability']:.3f}")
+                exp2.metric("Explained log", explanation["log_id"])
+                exp3.metric("Context rows", explanation.get("context_rows", 0))
+                st.caption(
+                    f"Model: {explanation['model_family']} | "
+                    f"Feature source: {explanation['feature_source']} | "
+                    "Explanation target: anomaly class"
+                )
+                explanation_frame = _to_frame(explanation.get("top_features", []))
+                if explanation_frame.empty:
+                    render_empty("LIME did not return any local feature contributions for this alert.")
+                else:
+                    st.dataframe(
+                        explanation_frame[["rank", "feature", "value", "weight", "direction", "rule"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
         st.subheader("Feedback history")
         try:
             feedback_history = data.fetch_feedback_history(int(detail["id"]))
