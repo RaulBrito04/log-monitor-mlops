@@ -8,7 +8,11 @@ from unittest.mock import MagicMock
 
 import psycopg2
 import pytest
+from alembic import command
+from alembic.config import Config
 from dotenv import load_dotenv
+
+from src.db.config import build_sqlalchemy_url
 
 load_dotenv()
 load_dotenv("docker/.env")
@@ -22,7 +26,7 @@ TEST_DB_CONFIG = {
 }
 
 ADMIN_DB_NAME = os.getenv("POSTGRES_DB", "logmonitor")
-SCHEMA_PATH = Path("docker/init.sql")
+ALEMBIC_INI_PATH = Path("alembic.ini")
 
 
 def _terminate_db_connections(cursor, database_name: str) -> None:
@@ -36,10 +40,19 @@ def _terminate_db_connections(cursor, database_name: str) -> None:
     )
 
 
-def _apply_schema(cursor) -> None:
-    schema_sql = SCHEMA_PATH.read_text(encoding="utf-8-sig")
-    for statement in [chunk.strip() for chunk in schema_sql.split(";") if chunk.strip()]:
-        cursor.execute(statement)
+def _apply_schema_via_alembic(db_config: dict[str, object]) -> None:
+    alembic_cfg = Config(str(ALEMBIC_INI_PATH))
+    alembic_cfg.set_main_option(
+        "sqlalchemy.url",
+        build_sqlalchemy_url(
+            host=str(db_config["host"]),
+            port=str(db_config["port"]),
+            database=str(db_config["database"]),
+            user=str(db_config["user"]),
+            password=str(db_config["password"]),
+        ),
+    )
+    command.upgrade(alembic_cfg, "head")
 
 
 @pytest.fixture
@@ -63,12 +76,7 @@ def test_db() -> dict[str, object]:
     admin_cursor.close()
     admin_conn.close()
 
-    test_conn = psycopg2.connect(**TEST_DB_CONFIG)
-    test_conn.autocommit = True
-    test_cursor = test_conn.cursor()
-    _apply_schema(test_cursor)
-    test_cursor.close()
-    test_conn.close()
+    _apply_schema_via_alembic(TEST_DB_CONFIG)
 
     yield TEST_DB_CONFIG
 

@@ -397,7 +397,7 @@ Para o código: o Git tem o histórico completo. Um rollback é um `git revert` 
 
 Para os modelos ML: o MLflow tem o histórico de versões de cada modelo. Um rollback do modelo é carregar a versão anterior a partir do MLflow registry sem necessidade de retreino.
 
-Para a base de dados: migrations de esquema são o ponto mais delicado. Nesta fase, as migrations são manuais e documentadas. Para produção, um sistema de migrations com rollback (como Alembic para PostgreSQL) seria o próximo passo.
+Para a base de dados: o schema esta versionado com Alembic. O caminho normal e `alembic upgrade head` para aplicar revisoes e `alembic downgrade -1` para recuar uma revisao em ambiente controlado. O ponto delicado continua a ser gerir mudancas destrutivas ou incompativeis com dados reais, por isso cada migration deve ser pequena, reversivel e validada antes de producao.
 
 ---
 

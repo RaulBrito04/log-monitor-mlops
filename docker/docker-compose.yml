@@ -11,7 +11,6 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       - ./scripts/healthcheck_postgres.sh:/docker/scripts/healthcheck_postgres.sh:ro
     healthcheck:
       test: ["CMD", "sh", "/docker/scripts/healthcheck_postgres.sh"]
@@ -22,6 +21,25 @@ services:
     networks:
       - backend
     restart: unless-stopped
+
+
+  db-migrate:
+    build:
+      context: ..
+      dockerfile: docker/dockerfiles/Dockerfile.db-migrate
+    container_name: logmonitor-db-migrate
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-logmonitor}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: "no"
 
   mlflow:
     image: python:3.12-slim
@@ -95,6 +113,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
     networks:
       - backend
       - frontend
@@ -141,6 +161,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
       flask-app:
         condition: service_healthy
       prometheus:
@@ -172,6 +194,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
       flask-app:
         condition: service_healthy
     networks:
@@ -194,6 +218,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
     networks:
       - backend
     restart: unless-stopped
@@ -222,6 +248,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
       mlflow:
         condition: service_healthy
     networks:

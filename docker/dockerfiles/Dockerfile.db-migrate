@@ -1,0 +1,27 @@
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+FROM python:3.12-slim AS runtime
+
+WORKDIR /app
+
+RUN groupadd --gid 1001 appgroup     && useradd --uid 1001 --gid appgroup --no-create-home --shell /usr/sbin/nologin appuser
+
+COPY --from=builder /install /usr/local
+COPY --chown=appuser:appgroup alembic.ini ./alembic.ini
+COPY --chown=appuser:appgroup alembic/ ./alembic/
+COPY --chown=appuser:appgroup src/db/ ./src/db/
+COPY --chown=appuser:appgroup src/__init__.py ./src/__init__.py
+COPY --chown=appuser:appgroup .env.example ./.env
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH=/app
+
+USER appuser
+
+CMD ["alembic", "upgrade", "head"]

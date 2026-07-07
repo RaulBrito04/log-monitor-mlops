@@ -44,7 +44,12 @@ docker compose -f docker/docker-compose.yml up -d
 
 # Verificar estado
 docker compose -f docker/docker-compose.yml ps
+
+# Verificar migrations aplicadas
+./venv/bin/alembic current
 ```
+**Nota:** o servico `db-migrate` e um job one-shot; aplica as migrations Alembic e termina com codigo `0` por design.
+
 
 **Interfaces disponíveis após arranque:**
 
@@ -184,7 +189,7 @@ Summary       →  relatório no GitHub
 | Camada | Tecnologias |
 |---|---|
 | Aplicação | Python 3.12 · Flask · Pydantic · Flask-Limiter |
-| Armazenamento | PostgreSQL 16 · TimescaleDB · SQLAlchemy |
+| Armazenamento | PostgreSQL 16 / TimescaleDB / SQLAlchemy / Alembic |
 | ML | Scikit-learn · Isolation Forest · Random Forest · SHAP |
 | MLOps | MLflow · Joblib |
 | Containers | Docker · Docker Compose · multi-stage builds |
