@@ -33,6 +33,28 @@ from src.monitoring.metrics import observe_pipeline_stage, persist_component_run
 load_dotenv()
 
 
+RULE_ALERT_UPSERT = """
+            ON CONFLICT (source, dedup_key)
+            WHERE source = 'rule' AND dedup_key IS NOT NULL
+            DO UPDATE SET
+                severity = EXCLUDED.severity,
+                confidence = EXCLUDED.confidence,
+                description = EXCLUDED.description,
+                log_ids = EXCLUDED.log_ids,
+                ip = EXCLUDED.ip,
+                timestamp = EXCLUDED.timestamp,
+                metadata = EXCLUDED.metadata
+            WHERE
+                alerts.severity IS DISTINCT FROM EXCLUDED.severity
+             OR alerts.confidence IS DISTINCT FROM EXCLUDED.confidence
+             OR alerts.description IS DISTINCT FROM EXCLUDED.description
+             OR alerts.log_ids IS DISTINCT FROM EXCLUDED.log_ids
+             OR alerts.ip IS DISTINCT FROM EXCLUDED.ip
+             OR alerts.timestamp IS DISTINCT FROM EXCLUDED.timestamp
+             OR alerts.metadata IS DISTINCT FROM EXCLUDED.metadata
+"""
+
+
 def _env_int(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None or not value.strip():
@@ -50,6 +72,40 @@ def _env_window(default: str = "60 seconds") -> str:
     return value.strip()
 
 
+def _dedup_key_expr(*parts: str) -> str:
+    return f"MD5(CONCAT_WS('|', {', '.join(parts)}))"
+
+
+def _render_rule_sql(template: str, *, window: str, dedup_key_expr: str) -> str:
+    return (
+        template.replace("{window}", window)
+        .replace("{dedup_key}", dedup_key_expr)
+        .replace("{conflict_clause}", RULE_ALERT_UPSERT)
+    )
+
+
+def ensure_alert_dedup_schema(conn) -> None:
+    statements = [
+        "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS dedup_key VARCHAR(64)",
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_rule_dedup
+        ON alerts (source, dedup_key)
+        WHERE source = 'rule' AND dedup_key IS NOT NULL
+        """,
+    ]
+
+    cursor = conn.cursor()
+    try:
+        for statement in statements:
+            cursor.execute(statement)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+
+
 def get_rules(window):
     """
     Retorna as 6 regras SQL com a janela de tempo fornecida.
@@ -58,9 +114,10 @@ def get_rules(window):
     return [
         (
             "Brute Force Detection",
-            """
+            _render_rule_sql(
+                """
             INSERT INTO alerts (alert_type, severity, source, confidence,
-                                description, log_ids, ip, timestamp, metadata)
+                                description, log_ids, ip, timestamp, metadata, dedup_key)
             SELECT
                 'brute_force', 'HIGH', 'rule', 1.0,
                 'Detected ' || COUNT(*) || ' failed login attempts from IP ' || ip,
@@ -73,20 +130,30 @@ def get_rules(window):
                     'time_window',        '{window}',
                     'first_attempt',      MIN(timestamp),
                     'last_attempt',       MAX(timestamp)
-                )
+                ),
+                {dedup_key}
             FROM raw_logs
             WHERE endpoint = '/login'
               AND status IN (401, 429)
               AND timestamp > NOW() - INTERVAL '{window}'
             GROUP BY ip
-            HAVING COUNT(*) >= 5;
-            """.replace("{window}", window),
+            HAVING COUNT(*) >= 5
+            {conflict_clause};
+            """,
+                window=window,
+                dedup_key_expr=_dedup_key_expr(
+                    "'brute_force'",
+                    "COALESCE(HOST(ip), '-')",
+                    "COALESCE(ARRAY_TO_STRING(ARRAY_AGG(id ORDER BY timestamp), ','), '-')",
+                ),
+            ),
         ),
         (
             "SQL Injection Detection",
-            """
+            _render_rule_sql(
+                """
             INSERT INTO alerts (alert_type, severity, source, confidence,
-                                description, log_ids, ip, timestamp, metadata)
+                                description, log_ids, ip, timestamp, metadata, dedup_key)
             SELECT
                 'sql_injection', 'CRITICAL', 'rule', 1.0,
                 'SQL injection attempt from IP ' || ip || ' on ' || endpoint,
@@ -97,7 +164,8 @@ def get_rules(window):
                     'endpoint', endpoint,
                     'method',   method,
                     'attempts', COUNT(*)
-                )
+                ),
+                {dedup_key}
             FROM raw_logs
             WHERE timestamp > NOW() - INTERVAL '{window}'
               AND (
@@ -107,14 +175,25 @@ def get_rules(window):
                OR endpoint ILIKE '%--%'
               )
             GROUP BY ip, endpoint, method
-            HAVING COUNT(*) >= 1;
-            """.replace("{window}", window),
+            HAVING COUNT(*) >= 1
+            {conflict_clause};
+            """,
+                window=window,
+                dedup_key_expr=_dedup_key_expr(
+                    "'sql_injection'",
+                    "COALESCE(HOST(ip), '-')",
+                    "COALESCE(endpoint, '-')",
+                    "COALESCE(method, '-')",
+                    "COALESCE(ARRAY_TO_STRING(ARRAY_AGG(id ORDER BY timestamp), ','), '-')",
+                ),
+            ),
         ),
         (
             "Port Scanning Detection",
-            """
+            _render_rule_sql(
+                """
             INSERT INTO alerts (alert_type, severity, source, confidence,
-                                description, log_ids, ip, timestamp, metadata)
+                                description, log_ids, ip, timestamp, metadata, dedup_key)
             SELECT
                 'port_scanning', 'MEDIUM', 'rule', 0.9,
                 'Scanning: ' || COUNT(DISTINCT endpoint) || ' endpoints from IP ' || ip,
@@ -127,18 +206,28 @@ def get_rules(window):
                     'endpoints_list',      ARRAY_AGG(DISTINCT endpoint),
                     'time_window',         '{window}',
                     'average_response_ms', AVG(response_time_ms)
-                )
+                ),
+                {dedup_key}
             FROM raw_logs
             WHERE timestamp > NOW() - INTERVAL '{window}'
             GROUP BY ip
-            HAVING COUNT(DISTINCT endpoint) >= 10;
-            """.replace("{window}", window),
+            HAVING COUNT(DISTINCT endpoint) >= 10
+            {conflict_clause};
+            """,
+                window=window,
+                dedup_key_expr=_dedup_key_expr(
+                    "'port_scanning'",
+                    "COALESCE(HOST(ip), '-')",
+                    "COALESCE(ARRAY_TO_STRING(ARRAY_AGG(id ORDER BY timestamp), ','), '-')",
+                ),
+            ),
         ),
         (
             "Path Traversal Detection",
-            """
+            _render_rule_sql(
+                """
             INSERT INTO alerts (alert_type, severity, source, confidence,
-                                description, log_ids, ip, timestamp, metadata)
+                                description, log_ids, ip, timestamp, metadata, dedup_key)
             SELECT
                 'path_traversal', 'CRITICAL', 'rule', 1.0,
                 'Path traversal attempt from IP ' || ip || ' on ' || endpoint,
@@ -156,7 +245,8 @@ def get_rules(window):
                         WHEN endpoint ILIKE '%/proc/%'      THEN 'proc filesystem access'
                         ELSE 'other'
                     END
-                )
+                ),
+                {dedup_key}
             FROM raw_logs
             WHERE timestamp > NOW() - INTERVAL '{window}'
               AND (
@@ -167,14 +257,25 @@ def get_rules(window):
                OR endpoint ILIKE '%/var/log/%'
               )
             GROUP BY ip, endpoint, method
-            HAVING COUNT(*) >= 1;
-            """.replace("{window}", window),
+            HAVING COUNT(*) >= 1
+            {conflict_clause};
+            """,
+                window=window,
+                dedup_key_expr=_dedup_key_expr(
+                    "'path_traversal'",
+                    "COALESCE(HOST(ip), '-')",
+                    "COALESCE(endpoint, '-')",
+                    "COALESCE(method, '-')",
+                    "COALESCE(ARRAY_TO_STRING(ARRAY_AGG(id ORDER BY timestamp), ','), '-')",
+                ),
+            ),
         ),
         (
             "Suspicious User Agent",
-            """
+            _render_rule_sql(
+                """
             INSERT INTO alerts (alert_type, severity, source, confidence,
-                                description, log_ids, ip, timestamp, metadata)
+                                description, log_ids, ip, timestamp, metadata, dedup_key)
             SELECT
                 'suspicious_user_agent', 'MEDIUM', 'rule', 0.85,
                 'Suspicious tool detected from IP ' || ip,
@@ -185,7 +286,8 @@ def get_rules(window):
                     'user_agent', data->>'user_agent',
                     'requests',   COUNT(*),
                     'endpoints',  ARRAY_AGG(DISTINCT endpoint)
-                )
+                ),
+                {dedup_key}
             FROM raw_logs
             WHERE timestamp > NOW() - INTERVAL '{window}'
               AND (
@@ -199,14 +301,24 @@ def get_rules(window):
                OR data->>'user_agent' ILIKE '%curl%'
               )
             GROUP BY ip, data->>'user_agent'
-            HAVING COUNT(*) >= 3;
-            """.replace("{window}", window),
+            HAVING COUNT(*) >= 3
+            {conflict_clause};
+            """,
+                window=window,
+                dedup_key_expr=_dedup_key_expr(
+                    "'suspicious_user_agent'",
+                    "COALESCE(HOST(ip), '-')",
+                    "COALESCE(data->>'user_agent', '-')",
+                    "COALESCE(ARRAY_TO_STRING(ARRAY_AGG(id ORDER BY timestamp), ','), '-')",
+                ),
+            ),
         ),
         (
             "Time-Based Anomaly",
-            """
+            _render_rule_sql(
+                """
             INSERT INTO alerts (alert_type, severity, source, confidence,
-                                description, log_ids, ip, timestamp, metadata)
+                                description, log_ids, ip, timestamp, metadata, dedup_key)
             SELECT
                 'time_anomaly', 'LOW', 'rule', 0.7,
                 'Off-hours activity: ' || COUNT(*) || ' requests from IP ' || ip
@@ -219,7 +331,8 @@ def get_rules(window):
                     'unique_endpoints',  COUNT(DISTINCT endpoint),
                     'hours_active',      ARRAY_AGG(DISTINCT EXTRACT(HOUR FROM timestamp)::int),
                     'time_window',       '{window}'
-                )
+                ),
+                {dedup_key}
             FROM raw_logs
             WHERE timestamp > NOW() - INTERVAL '{window}'
               AND (
@@ -227,8 +340,16 @@ def get_rules(window):
                OR EXTRACT(HOUR FROM timestamp) < 6
               )
             GROUP BY ip
-            HAVING COUNT(*) >= 20;
-            """.replace("{window}", window),
+            HAVING COUNT(*) >= 20
+            {conflict_clause};
+            """,
+                window=window,
+                dedup_key_expr=_dedup_key_expr(
+                    "'time_anomaly'",
+                    "COALESCE(HOST(ip), '-')",
+                    "COALESCE(ARRAY_TO_STRING(ARRAY_AGG(id ORDER BY timestamp), ','), '-')",
+                ),
+            ),
         ),
     ]
 
@@ -369,6 +490,7 @@ def mode_historical(days):
     """Corre uma vez sobre todo o historico."""
     print(f"\nModo HISTORICAL -- analisando ultimos {days} dias")
     conn = connect()
+    ensure_alert_dedup_schema(conn)
     cursor = conn.cursor()
     summary = run_once(cursor, f"{days} days", "HISTORICAL")
     commit_started = time.perf_counter()
@@ -387,6 +509,7 @@ def mode_realtime(interval_seconds: int | None = None, window: str | None = None
     print(f"\nModo REALTIME -- janela: {resolved_window} | ciclo: {resolved_interval}s")
     print("Ctrl+C para parar.\n")
     conn = connect()
+    ensure_alert_dedup_schema(conn)
     cursor = conn.cursor()
     try:
         while True:

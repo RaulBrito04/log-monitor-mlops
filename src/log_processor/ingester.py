@@ -1,10 +1,12 @@
-﻿"""
+"""
 Log ingestion pipeline: reads logs and inserts them into PostgreSQL.
 
 Usage:
     python src/log_processor/ingester.py logs/app.log
     python src/log_processor/ingester.py logs/app.log --batch-size 500
     python src/log_processor/ingester.py /tmp/access.log --format apache_combined
+    python src/log_processor/ingester.py /tmp/access.log --format nginx_combined
+    python src/log_processor/ingester.py /tmp/access.json --format web_json
 """
 
 import argparse
@@ -13,7 +15,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -37,7 +39,14 @@ DB_CONFIG = {
     "password": os.getenv("POSTGRES_PASSWORD", "changeme"),
 }
 
-SUPPORTED_FORMATS = ("json", "apache_combined", "auto")
+SUPPORTED_FORMATS = (
+    "json",
+    "web_json",
+    "apache_combined",
+    "apache_common",
+    "nginx_combined",
+    "auto",
+)
 
 APACHE_ACCESS_PATTERN = re.compile(
     r'^(?P<ip>\S+)\s+'
@@ -50,6 +59,37 @@ APACHE_ACCESS_PATTERN = re.compile(
     r'"(?P<referrer>[^"]*)"\s+'
     r'"(?P<user_agent>[^"]*)")?'
     r'(?P<extra>.*)$'
+)
+
+TIMESTAMP_FIELD_CANDIDATES = ("timestamp", "@timestamp", "time", "time_iso8601", "time_local", "ts")
+IP_FIELD_CANDIDATES = ("ip", "remote_addr", "client_ip", "x_forwarded_for", "http_x_forwarded_for")
+METHOD_FIELD_CANDIDATES = ("method", "request_method", "http_method", "verb")
+ENDPOINT_FIELD_CANDIDATES = ("endpoint", "path", "uri", "request_uri", "url")
+STATUS_FIELD_CANDIDATES = ("status", "status_code", "response_status")
+USER_AGENT_FIELD_CANDIDATES = ("user_agent", "http_user_agent", "agent")
+REFERRER_FIELD_CANDIDATES = ("referrer", "http_referer", "referer")
+BYTES_SENT_FIELD_CANDIDATES = ("bytes_sent", "body_bytes_sent", "response_size", "bytes")
+REQUEST_LINE_FIELD_CANDIDATES = ("request", "request_line")
+PROTOCOL_FIELD_CANDIDATES = ("protocol", "server_protocol")
+RESPONSE_TIME_FIELD_CANDIDATES = (
+    ("response_time_ms", "ms"),
+    ("request_time_ms", "ms"),
+    ("duration_ms", "ms"),
+    ("latency_ms", "ms"),
+    ("response_time", "auto"),
+    ("request_time", "seconds"),
+    ("upstream_response_time", "seconds"),
+    ("duration", "auto"),
+    ("latency", "auto"),
+)
+WEB_HINT_KEYS = set(
+    METHOD_FIELD_CANDIDATES
+    + ENDPOINT_FIELD_CANDIDATES
+    + STATUS_FIELD_CANDIDATES
+    + USER_AGENT_FIELD_CANDIDATES
+    + REQUEST_LINE_FIELD_CANDIDATES
+    + PROTOCOL_FIELD_CANDIDATES
+    + tuple(name for name, _unit in RESPONSE_TIME_FIELD_CANDIDATES)
 )
 
 
@@ -69,6 +109,113 @@ def get_db_connection(max_retries: int = 5):
                 raise
 
 
+def _pick_first_present(payload: dict, candidates: tuple[str, ...]):
+    for candidate in candidates:
+        if candidate in payload and payload[candidate] not in (None, "", "-"):
+            return payload[candidate]
+    return None
+
+
+def _normalize_text_value(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        for item in value:
+            normalized = _normalize_text_value(item)
+            if normalized is not None:
+                return normalized
+        return None
+
+    text = str(value).strip().strip('"').strip("'")
+    if text == '-':
+        return None
+    return text or None
+
+
+def _normalize_ip_value(value) -> Optional[str]:
+    text = _normalize_text_value(value)
+    if text is None:
+        return None
+    return text.split(',')[0].strip()
+
+
+def _normalize_timestamp_value(value) -> Optional[str]:
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric > 1_000_000_000_000:
+            numeric /= 1000.0
+        return datetime.fromtimestamp(numeric, tz=timezone.utc).isoformat()
+
+    text = _normalize_text_value(value)
+    if text is None:
+        return None
+
+    iso_candidate = text.replace('Z', '+00:00')
+    parsers = [
+        lambda raw: datetime.fromisoformat(raw),
+        lambda raw: datetime.strptime(raw, "%d/%b/%Y:%H:%M:%S %z"),
+        lambda raw: datetime.strptime(raw, "%Y-%m-%dT%H:%M:%S"),
+        lambda raw: datetime.strptime(raw, "%Y-%m-%d %H:%M:%S"),
+    ]
+    for parser in parsers:
+        try:
+            parsed = parser(iso_candidate)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.isoformat()
+        except ValueError:
+            continue
+    return text
+
+
+def _normalize_status_value(value) -> Optional[int]:
+    text = _normalize_text_value(value)
+    if text is None:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
+def _normalize_bytes_value(value) -> Optional[int]:
+    text = _normalize_text_value(value)
+    if text is None:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
+def _normalize_response_time_value(value, unit: str) -> Optional[float]:
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        numeric_value = float(value)
+        raw_text = str(value)
+    else:
+        raw_text = _normalize_text_value(value)
+        if raw_text is None:
+            return None
+        match = re.search(r'-?\d+(?:\.\d+)?', raw_text)
+        if match is None:
+            return None
+        numeric_value = float(match.group(0))
+
+    if unit == "ms":
+        return round(numeric_value, 3)
+    if unit == "seconds":
+        return round(numeric_value * 1000.0, 3)
+    if '.' in raw_text and abs(numeric_value) <= 10:
+        return round(numeric_value * 1000.0, 3)
+    return round(numeric_value, 3)
+
+
 def parse_json_log_line(line: str) -> Optional[dict]:
     """Parse one JSON log line."""
     try:
@@ -78,6 +225,8 @@ def parse_json_log_line(line: str) -> Optional[dict]:
 
     if not isinstance(payload, dict):
         return None
+    if WEB_HINT_KEYS.intersection(payload):
+        return _normalize_web_json_payload(payload, source_format="json", default_log_type="web")
     return payload
 
 
@@ -115,8 +264,92 @@ def _parse_optional_request_time_ms(extra_fields: str) -> Optional[float]:
     return None
 
 
-def parse_apache_combined_log_line(line: str) -> Optional[dict]:
-    """Parse one Apache/Nginx access-log line close to the combined format."""
+def _looks_like_web_payload(payload: dict) -> bool:
+    return any(payload.get(field) is not None for field in ("method", "endpoint", "status", "request_line", "user_agent"))
+
+
+def _normalize_web_json_payload(payload: dict, source_format: str, default_log_type: str) -> dict:
+    normalized = dict(payload)
+
+    request_line = _normalize_text_value(_pick_first_present(normalized, REQUEST_LINE_FIELD_CANDIDATES))
+    method = _normalize_text_value(_pick_first_present(normalized, METHOD_FIELD_CANDIDATES))
+    endpoint = _normalize_text_value(_pick_first_present(normalized, ENDPOINT_FIELD_CANDIDATES))
+    protocol = _normalize_text_value(_pick_first_present(normalized, PROTOCOL_FIELD_CANDIDATES))
+
+    if request_line and (method is None or endpoint is None or protocol is None):
+        parsed_method, parsed_endpoint, parsed_protocol = _parse_request_components(request_line)
+        method = method or parsed_method
+        endpoint = endpoint or parsed_endpoint
+        protocol = protocol or parsed_protocol
+
+    timestamp = _normalize_timestamp_value(_pick_first_present(normalized, TIMESTAMP_FIELD_CANDIDATES))
+    if timestamp is not None:
+        normalized["timestamp"] = timestamp
+
+    ip = _normalize_ip_value(_pick_first_present(normalized, IP_FIELD_CANDIDATES))
+    if ip is not None:
+        normalized["ip"] = ip
+
+    if method is not None:
+        normalized["method"] = method
+    if endpoint is not None:
+        normalized["endpoint"] = endpoint
+    if protocol is not None:
+        normalized["protocol"] = protocol
+
+    status = _normalize_status_value(_pick_first_present(normalized, STATUS_FIELD_CANDIDATES))
+    if status is not None:
+        normalized["status"] = status
+
+    user_agent = _normalize_text_value(_pick_first_present(normalized, USER_AGENT_FIELD_CANDIDATES))
+    if user_agent is not None:
+        normalized["user_agent"] = user_agent
+
+    referrer = _normalize_text_value(_pick_first_present(normalized, REFERRER_FIELD_CANDIDATES))
+    if referrer is not None:
+        normalized["referrer"] = referrer
+
+    bytes_sent = _normalize_bytes_value(_pick_first_present(normalized, BYTES_SENT_FIELD_CANDIDATES))
+    if bytes_sent is not None:
+        normalized["bytes_sent"] = bytes_sent
+
+    for field_name, unit in RESPONSE_TIME_FIELD_CANDIDATES:
+        if field_name in normalized and normalized[field_name] not in (None, "", "-"):
+            response_time_ms = _normalize_response_time_value(normalized[field_name], unit)
+            if response_time_ms is not None:
+                normalized["response_time_ms"] = response_time_ms
+            break
+
+    if request_line is not None:
+        normalized["request_line"] = request_line
+
+    if _looks_like_web_payload(normalized):
+        normalized.setdefault("source_format", source_format)
+        normalized.setdefault("log_type", default_log_type)
+    return normalized
+
+
+def parse_web_json_log_line(line: str) -> Optional[dict]:
+    """Parse structured JSON access logs from web servers or proxies."""
+    try:
+        payload = json.loads(line.strip())
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    normalized = _normalize_web_json_payload(payload, source_format="web_json", default_log_type="web_access")
+    return normalized if _looks_like_web_payload(normalized) else None
+
+
+def parse_access_log_line(
+    line: str,
+    *,
+    source_format: str = "apache_combined",
+    default_log_type: str = "apache_access",
+) -> Optional[dict]:
+    """Parse one Apache/Nginx access-log line close to the combined/common format."""
     match = APACHE_ACCESS_PATTERN.match(line.strip())
     if not match:
         return None
@@ -133,7 +366,7 @@ def parse_apache_combined_log_line(line: str) -> Optional[dict]:
     bytes_sent_value = groups["body_bytes_sent"]
 
     return {
-        "log_type": "apache_access",
+        "log_type": default_log_type,
         "timestamp": timestamp.isoformat(),
         "ip": None if groups["ip"] == "-" else groups["ip"],
         "method": method,
@@ -145,8 +378,13 @@ def parse_apache_combined_log_line(line: str) -> Optional[dict]:
         "bytes_sent": None if bytes_sent_value == "-" else int(bytes_sent_value),
         "referrer": None if groups.get("referrer") in (None, "-") else groups["referrer"],
         "request_line": groups["request"],
-        "source_format": "apache_combined",
+        "source_format": source_format,
     }
+
+
+def parse_apache_combined_log_line(line: str) -> Optional[dict]:
+    """Backwards-compatible wrapper for Apache combined logs."""
+    return parse_access_log_line(line, source_format="apache_combined", default_log_type="apache_access")
 
 
 def parse_log_line(line: str, log_format: str = "json") -> Optional[dict]:
@@ -162,18 +400,25 @@ def parse_log_line(line: str, log_format: str = "json") -> Optional[dict]:
 
     if log_format == "json":
         parsed = parse_json_log_line(stripped)
+    elif log_format == "web_json":
+        parsed = parse_web_json_log_line(stripped)
     elif log_format == "apache_combined":
-        parsed = parse_apache_combined_log_line(stripped)
+        parsed = parse_access_log_line(stripped, source_format="apache_combined", default_log_type="apache_access")
+    elif log_format == "apache_common":
+        parsed = parse_access_log_line(stripped, source_format="apache_common", default_log_type="apache_access")
+    elif log_format == "nginx_combined":
+        parsed = parse_access_log_line(stripped, source_format="nginx_combined", default_log_type="nginx_access")
     else:
         parsers = [
-            (parse_json_log_line, "json"),
-            (parse_apache_combined_log_line, "apache_combined"),
+            lambda raw: parse_web_json_log_line(raw),
+            lambda raw: parse_json_log_line(raw),
+            lambda raw: parse_access_log_line(raw, source_format="combined_access", default_log_type="web_access"),
         ]
         if not stripped.startswith("{"):
-            parsers.reverse()
+            parsers = [parsers[2], parsers[0], parsers[1]]
 
         parsed = None
-        for parser, _parser_name in parsers:
+        for parser in parsers:
             parsed = parser(stripped)
             if parsed is not None:
                 break
@@ -322,7 +567,7 @@ def ingest_from_file(filepath: str, batch_size: int = 100, log_format: str = "js
             )
 
             total_ingested += inserted
-            print(f"✓ Ingested {total_ingested} logs ({reason})")
+            print(f"âœ“ Ingested {total_ingested} logs ({reason})")
         except Exception as exc:
             conn.rollback()
             observe_pipeline_stage(
@@ -403,6 +648,10 @@ Examples:
   python ingester.py logs/app.log --batch-size 500
   python ingester.py logs/production.log --batch-size 1000
   python ingester.py /tmp/access.log --format apache_combined
+  python ingester.py /tmp/access.log --format nginx_combined
+  python ingester.py /tmp/access.json --format web_json
+  python ingester.py /tmp/access.log --format nginx_combined
+  python ingester.py /tmp/access.json --format web_json
         """,
     )
 
@@ -426,3 +675,4 @@ Examples:
 
 if __name__ == "__main__":
     main()
+
