@@ -11,7 +11,7 @@ import psycopg2
 from prometheus_client import Counter, Gauge, Histogram, Info
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-RUNTIME_METRICS_FILE = PROJECT_ROOT / "data" / "runtime_metrics.json"
+RUNTIME_METRICS_FILE = Path(os.getenv("RUNTIME_METRICS_FILE", str(PROJECT_ROOT / "data" / "runtime_metrics.json")))
 
 DB_QUERY_DURATION = Histogram(
     "logmonitor_db_query_duration_seconds",
@@ -338,4 +338,5 @@ def refresh_monitoring_metrics(force: bool = False) -> None:
     )
 
     _LAST_REFRESH_TS = now
+
 

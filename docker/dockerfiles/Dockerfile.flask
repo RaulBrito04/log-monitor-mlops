@@ -18,7 +18,7 @@ COPY --chown=appuser:appgroup src/monitoring/ ./src/monitoring/
 COPY --chown=appuser:appgroup src/__init__.py ./src/__init__.py
 COPY --chown=appuser:appgroup .env.example ./.env
 
-RUN mkdir -p /app/logs && chown -R appuser:appgroup /app
+RUN mkdir -p /app/logs /app/runtime && chown -R appuser:appgroup /app
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1

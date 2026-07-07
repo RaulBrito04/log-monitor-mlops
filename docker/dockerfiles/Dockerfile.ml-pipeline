@@ -18,21 +18,24 @@ RUN groupadd --gid 1001 appgroup \
     && useradd --uid 1001 --gid appgroup --no-create-home --shell /usr/sbin/nologin appuser
 
 COPY --from=builder /install /usr/local
-COPY --chown=appuser:appgroup src/ml/ ./src/ml/
+COPY --chown=appuser:appgroup src/ ./src/
 COPY --chown=appuser:appgroup models/ ./models/
 COPY --chown=appuser:appgroup data/ ./data/
 COPY --chown=appuser:appgroup .env.example ./.env
 
-RUN mkdir -p /app/models /app/data /app/experiments /mlruns \
+RUN mkdir -p /app/models /app/data /app/runtime /app/experiments /mlruns \
     && chown -R appuser:appgroup /app /mlruns
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV MPLBACKEND=Agg
+ENV PYTHONPATH=/app
 
 USER appuser
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "from pathlib import Path; assert Path('models/isolation_forest_latest.pkl').exists(); assert Path('data/selected_features.txt').exists(); print('ok')"
 
-CMD ["python", "src/ml/realtime_hybrid.py"]
+CMD ["python", "-m", "src.ml.realtime_hybrid"]
+
+

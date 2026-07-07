@@ -1,4 +1,4 @@
-﻿"""
+"""
 Rule Engine - Detecao baseada em regras SQL
 6 regras: brute force, sql injection, port scanning,
           path traversal, suspicious user agent, time-based anomaly
@@ -31,6 +31,23 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.monitoring.metrics import observe_pipeline_stage, persist_component_runtime_metrics
 
 load_dotenv()
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_window(default: str = "60 seconds") -> str:
+    value = os.getenv("RULE_ENGINE_WINDOW")
+    if value is None or not value.strip():
+        return default
+    return value.strip()
 
 
 def get_rules(window):
@@ -309,8 +326,9 @@ def connect():
     )
 
 
-def _finalize_cycle(summary, commit_duration):
-    total_duration = summary["rules_duration_seconds"] + commit_duration
+def _finalize_cycle(summary, commit_duration, *, configured_window=None, configured_interval_seconds=None, sleep_duration=0.0):
+    active_duration = summary["rules_duration_seconds"] + commit_duration
+    total_duration = active_duration + sleep_duration
     observe_pipeline_stage(
         "rule_engine",
         "commit_cycle",
@@ -321,15 +339,27 @@ def _finalize_cycle(summary, commit_duration):
     observe_pipeline_stage(
         "rule_engine",
         "cycle_total",
-        total_duration,
+        active_duration,
         batch_size=summary["rules_executed"],
         row_count=summary["alerts_created"],
     )
+    if sleep_duration > 0:
+        observe_pipeline_stage(
+            "rule_engine",
+            "sleep_wait",
+            sleep_duration,
+            batch_size=summary["rules_executed"],
+            row_count=0,
+        )
     persist_component_runtime_metrics(
         "rule_engine",
         {
             **summary,
+            "configured_window": configured_window,
+            "configured_interval_seconds": configured_interval_seconds,
             "commit_duration_seconds": round(commit_duration, 6),
+            "active_duration_seconds": round(active_duration, 6),
+            "sleep_duration_seconds": round(sleep_duration, 6),
             "duration_seconds": round(total_duration, 6),
         },
     )
@@ -343,25 +373,39 @@ def mode_historical(days):
     summary = run_once(cursor, f"{days} days", "HISTORICAL")
     commit_started = time.perf_counter()
     conn.commit()
-    _finalize_cycle(summary, time.perf_counter() - commit_started)
+    _finalize_cycle(summary, time.perf_counter() - commit_started, configured_window=f"{days} days")
     cursor.close()
     conn.close()
     print("Analise historica concluida.")
 
 
-def mode_realtime(interval_seconds):
+def mode_realtime(interval_seconds: int | None = None, window: str | None = None):
     """Corre em loop, analisando janela recente a cada interval_seconds."""
-    print(f"\nModo REALTIME -- janela: 60 seconds | ciclo: {interval_seconds}s")
+    resolved_interval = max(interval_seconds if interval_seconds is not None else _env_int("RULE_ENGINE_INTERVAL_SEC", 60), 0)
+    resolved_window = window or _env_window("60 seconds")
+
+    print(f"\nModo REALTIME -- janela: {resolved_window} | ciclo: {resolved_interval}s")
     print("Ctrl+C para parar.\n")
     conn = connect()
     cursor = conn.cursor()
     try:
         while True:
-            summary = run_once(cursor, "60 seconds", "REALTIME")
+            cycle_started = time.perf_counter()
+            summary = run_once(cursor, resolved_window, "REALTIME")
             commit_started = time.perf_counter()
             conn.commit()
-            _finalize_cycle(summary, time.perf_counter() - commit_started)
-            time.sleep(interval_seconds)
+            commit_duration = time.perf_counter() - commit_started
+            active_duration = summary["rules_duration_seconds"] + commit_duration
+            sleep_duration = max(resolved_interval - active_duration, 0.0)
+            _finalize_cycle(
+                summary,
+                commit_duration,
+                configured_window=resolved_window,
+                configured_interval_seconds=resolved_interval,
+                sleep_duration=sleep_duration,
+            )
+            if sleep_duration > 0:
+                time.sleep(sleep_duration)
     except KeyboardInterrupt:
         print("\nParado pelo utilizador.")
     finally:
@@ -386,12 +430,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--interval",
         type=int,
-        default=60,
-        help="Segundos entre ciclos no modo realtime (default: 60)",
+        default=None,
+        help="Segundos entre ciclos no modo realtime (default: RULE_ENGINE_INTERVAL_SEC ou 60)",
+    )
+    parser.add_argument(
+        "--window",
+        default=None,
+        help="Janela PostgreSQL interval para o modo realtime (default: RULE_ENGINE_WINDOW ou 60 seconds)",
     )
     args = parser.parse_args()
 
     if args.mode == "historical":
         mode_historical(args.days)
     else:
-        mode_realtime(args.interval)
+        mode_realtime(args.interval, args.window)
