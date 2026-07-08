@@ -3,6 +3,8 @@
 ## Goal
 Move database schema management from ad-hoc SQL bootstrap into a versioned migration workflow suitable for real environments.
 
+Runtime services no longer mutate database schema during startup. The Flask incident workflow and the SQL rule engine now validate the migrated schema and fail fast if required objects are missing.
+
 ## Source of truth
 - Official schema source: `alembic/versions/`
 - Runtime configuration: `alembic.ini` + environment variables

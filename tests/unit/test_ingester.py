@@ -182,6 +182,34 @@ class TestBatchInsert:
         assert inserted == 1
         execute_values.assert_called_once()
 
+    def test_insert_logs_batch_copy_uses_copy_expert(self, mocker):
+        cursor = mocker.Mock()
+        logs = [
+            {
+                "timestamp": "2025-01-01T12:00:00+00:00",
+                "ip": "127.0.0.1",
+                "method": "GET",
+                "endpoint": "/health",
+                "status": 200,
+                "response_time_ms": 10,
+                "user_agent": "pytest",
+            }
+        ]
+
+        inserted = ingester.insert_logs_batch_copy(cursor, logs)
+
+        assert inserted == 1
+        cursor.copy_expert.assert_called_once()
+        copy_sql, buffer = cursor.copy_expert.call_args.args
+        assert "COPY raw_logs" in copy_sql
+        copied_payload = buffer.getvalue()
+        assert "/health" in copied_payload
+        assert "127.0.0.1" in copied_payload
+
+    def test_insert_logs_batch_with_method_rejects_unknown_method(self):
+        with pytest.raises(ValueError, match="Unsupported insert method"):
+            ingester.insert_logs_batch_with_method(None, [], insert_method="unknown")
+
     def test_get_db_connection_retries_then_succeeds(self, mocker):
         conn = mocker.Mock()
         connect = mocker.patch(
@@ -298,3 +326,32 @@ class TestBatchInsert:
     def test_ingest_from_file_missing_path_exits(self):
         with pytest.raises(SystemExit):
             ingester.ingest_from_file("/tmp/does-not-exist.log")
+
+
+    def test_ingest_from_file_processes_json_batches_with_copy(self, tmp_path, mocker):
+        logfile = tmp_path / "sample-copy.log"
+        logfile.write_text(
+            "\n".join(
+                [
+                    json.dumps({"timestamp": "2025-01-01T12:00:00+00:00", "ip": "127.0.0.1", "method": "GET", "endpoint": "/health", "status": 200, "response_time_ms": 10, "user_agent": "pytest"}),
+                    json.dumps({"timestamp": "2025-01-01T12:00:01+00:00", "ip": "127.0.0.2", "method": "GET", "endpoint": "/api/data", "status": 200, "response_time_ms": 11, "user_agent": "pytest"}),
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        cursor = mocker.Mock()
+        conn = mocker.Mock()
+        conn.cursor.return_value = cursor
+        mocker.patch("src.log_processor.ingester.get_db_connection", return_value=conn)
+        mocker.patch("src.log_processor.ingester.persist_component_runtime_metrics")
+        insert_batch = mocker.patch(
+            "src.log_processor.ingester.insert_logs_batch_with_method",
+            side_effect=lambda _cursor, batch, insert_method="execute_values": len(batch),
+        )
+
+        ingester.ingest_from_file(str(logfile), batch_size=2, insert_method="copy")
+
+        assert insert_batch.call_count == 1
+        assert insert_batch.call_args.kwargs["insert_method"] == "copy"
+        conn.commit.assert_called_once()

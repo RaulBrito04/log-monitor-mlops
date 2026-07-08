@@ -28,6 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.db.schema_checks import assert_rule_engine_schema
 from src.monitoring.metrics import observe_pipeline_stage, persist_component_runtime_metrics
 
 load_dotenv()
@@ -82,28 +83,6 @@ def _render_rule_sql(template: str, *, window: str, dedup_key_expr: str) -> str:
         .replace("{dedup_key}", dedup_key_expr)
         .replace("{conflict_clause}", RULE_ALERT_UPSERT)
     )
-
-
-def ensure_alert_dedup_schema(conn) -> None:
-    statements = [
-        "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS dedup_key VARCHAR(64)",
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_rule_dedup
-        ON alerts (source, dedup_key)
-        WHERE source = 'rule' AND dedup_key IS NOT NULL
-        """,
-    ]
-
-    cursor = conn.cursor()
-    try:
-        for statement in statements:
-            cursor.execute(statement)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cursor.close()
 
 
 def get_rules(window):
@@ -490,7 +469,7 @@ def mode_historical(days):
     """Corre uma vez sobre todo o historico."""
     print(f"\nModo HISTORICAL -- analisando ultimos {days} dias")
     conn = connect()
-    ensure_alert_dedup_schema(conn)
+    assert_rule_engine_schema(conn)
     cursor = conn.cursor()
     summary = run_once(cursor, f"{days} days", "HISTORICAL")
     commit_started = time.perf_counter()
@@ -509,7 +488,7 @@ def mode_realtime(interval_seconds: int | None = None, window: str | None = None
     print(f"\nModo REALTIME -- janela: {resolved_window} | ciclo: {resolved_interval}s")
     print("Ctrl+C para parar.\n")
     conn = connect()
-    ensure_alert_dedup_schema(conn)
+    assert_rule_engine_schema(conn)
     cursor = conn.cursor()
     try:
         while True:

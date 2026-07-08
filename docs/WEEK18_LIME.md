@@ -16,5 +16,5 @@
 - If the package or model artifacts are unavailable, the dashboard shows an empty-state message instead of failing hard.
 
 ## Remaining limitation
-- Counterfactual explanations are still open.
-- This iteration explains the supervised anomaly probability, not the full hybrid score.
+- Counterfactual explanations are now implemented as a separate local contrastive view documented in `docs/COUNTERFACTUALS.md`.
+- This iteration still explains the supervised anomaly probability, not the full hybrid score.

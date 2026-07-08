@@ -10,12 +10,14 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import os
 import re
 import sys
 import time
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
 from typing import Optional
 
@@ -47,6 +49,8 @@ SUPPORTED_FORMATS = (
     "nginx_combined",
     "auto",
 )
+
+INSERT_METHODS = ("execute_values", "copy")
 
 APACHE_ACCESS_PATTERN = re.compile(
     r'^(?P<ip>\S+)\s+'
@@ -460,8 +464,22 @@ def prepare_log_for_insert(log: dict) -> tuple:
     )
 
 
+def prepare_log_rows(logs: list[dict]) -> list[tuple]:
+    prepare_started = time.perf_counter()
+    rows = [prepare_log_for_insert(log) for log in logs]
+    prepare_duration = time.perf_counter() - prepare_started
+    observe_pipeline_stage(
+        "ingester",
+        "prepare_insert",
+        prepare_duration,
+        batch_size=len(rows),
+        row_count=len(rows),
+    )
+    return rows
+
+
 def insert_logs_batch(cursor, logs: list[dict]):
-    """Insert batch of logs using execute_values (fast)."""
+    """Insert batch of logs using execute_values (online default)."""
     if not logs:
         return 0
 
@@ -472,17 +490,7 @@ def insert_logs_batch(cursor, logs: list[dict]):
         ) VALUES %s
     """
 
-    prepare_started = time.perf_counter()
-    data = [prepare_log_for_insert(log) for log in logs]
-    prepare_duration = time.perf_counter() - prepare_started
-    observe_pipeline_stage(
-        "ingester",
-        "prepare_insert",
-        prepare_duration,
-        batch_size=len(data),
-        row_count=len(data),
-    )
-
+    data = prepare_log_rows(logs)
     execute_started = time.perf_counter()
     try:
         execute_values(cursor, query, data, page_size=len(data))
@@ -508,7 +516,71 @@ def insert_logs_batch(cursor, logs: list[dict]):
     return len(data)
 
 
-def ingest_from_file(filepath: str, batch_size: int = 100, log_format: str = "json"):
+def insert_logs_batch_copy(cursor, logs: list[dict]):
+    """Insert batch of logs using PostgreSQL COPY (offline bulk/backfill path)."""
+    if not logs:
+        return 0
+
+    rows = prepare_log_rows(logs)
+    buffer = StringIO()
+    writer = csv.writer(buffer)
+    for row in rows:
+        writer.writerow(
+            [
+                row[0],
+                row[1].isoformat() if isinstance(row[1], datetime) else row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+                row[6],
+                row[7],
+                row[8],
+            ]
+        )
+    buffer.seek(0)
+
+    copy_sql = """
+        COPY raw_logs (
+            log_type, timestamp, ip, method, endpoint,
+            status, response_time_ms, user_agent, data
+        ) FROM STDIN WITH (FORMAT CSV)
+    """
+
+    copy_started = time.perf_counter()
+    try:
+        cursor.copy_expert(copy_sql, buffer)
+    except Exception:
+        observe_pipeline_stage(
+            "ingester",
+            "copy_from",
+            time.perf_counter() - copy_started,
+            batch_size=len(rows),
+            row_count=0,
+            error_count=1,
+        )
+        raise
+
+    copy_duration = time.perf_counter() - copy_started
+    observe_pipeline_stage(
+        "ingester",
+        "copy_from",
+        copy_duration,
+        batch_size=len(rows),
+        row_count=len(rows),
+    )
+    return len(rows)
+
+
+def insert_logs_batch_with_method(cursor, logs: list[dict], insert_method: str = "execute_values") -> int:
+    if insert_method == "copy":
+        return insert_logs_batch_copy(cursor, logs)
+    if insert_method == "execute_values":
+        return insert_logs_batch(cursor, logs)
+    raise ValueError(f"Unsupported insert method '{insert_method}'. Supported values: {', '.join(INSERT_METHODS)}")
+
+
+def ingest_from_file(filepath: str, batch_size: int = 100, log_format: str = "json", insert_method: str = "execute_values"):
     """Ingest logs from file in batches."""
     if not os.path.exists(filepath):
         print(f"ERROR: File not found: {filepath}")
@@ -517,6 +589,7 @@ def ingest_from_file(filepath: str, batch_size: int = 100, log_format: str = "js
     print(f"Starting ingestion from: {filepath}")
     print(f"Batch size: {batch_size}")
     print(f"Log format: {log_format}")
+    print(f"Insert method: {insert_method}")
     print(f"Connecting to PostgreSQL at {DB_CONFIG['host']}:{DB_CONFIG['port']}")
 
     conn = get_db_connection()
@@ -545,7 +618,7 @@ def ingest_from_file(filepath: str, batch_size: int = 100, log_format: str = "js
 
         insert_started = time.perf_counter()
         try:
-            inserted = insert_logs_batch(cursor, batch)
+            inserted = insert_logs_batch_with_method(cursor, batch, insert_method=insert_method)
             insert_duration = time.perf_counter() - insert_started
             observe_pipeline_stage(
                 "ingester",
@@ -614,6 +687,7 @@ def ingest_from_file(filepath: str, batch_size: int = 100, log_format: str = "js
                 "source_file": filepath,
                 "log_format": log_format,
                 "configured_batch_size": batch_size,
+                "insert_method": insert_method,
                 "lines_read": total_lines,
                 "logs_ingested": total_ingested,
                 "failed_records": total_failed,
@@ -650,8 +724,7 @@ Examples:
   python ingester.py /tmp/access.log --format apache_combined
   python ingester.py /tmp/access.log --format nginx_combined
   python ingester.py /tmp/access.json --format web_json
-  python ingester.py /tmp/access.log --format nginx_combined
-  python ingester.py /tmp/access.json --format web_json
+  python ingester.py /tmp/backfill.log --insert-method copy --batch-size 5000
         """,
     )
 
@@ -668,9 +741,15 @@ Examples:
         default="json",
         help="Source log format (default: json)",
     )
+    parser.add_argument(
+        "--insert-method",
+        choices=INSERT_METHODS,
+        default="execute_values",
+        help="Insert path: execute_values for online mode, copy for offline bulk/backfill mode (default: execute_values)",
+    )
 
     args = parser.parse_args()
-    ingest_from_file(args.logfile, args.batch_size, log_format=args.format)
+    ingest_from_file(args.logfile, args.batch_size, log_format=args.format, insert_method=args.insert_method)
 
 
 if __name__ == "__main__":

@@ -23,32 +23,6 @@ class TestRuleDefinitions:
         assert "drop%table" in sql.lower()
 
 
-class TestSchemaPreparation:
-    def test_ensure_alert_dedup_schema_applies_migration_statements(self):
-        conn = MagicMock()
-        cursor = MagicMock()
-        conn.cursor.return_value = cursor
-
-        rule_engine.ensure_alert_dedup_schema(conn)
-
-        assert cursor.execute.call_count == 2
-        conn.commit.assert_called_once()
-        conn.rollback.assert_not_called()
-        cursor.close.assert_called_once()
-
-    def test_ensure_alert_dedup_schema_rolls_back_on_error(self):
-        conn = MagicMock()
-        cursor = MagicMock()
-        cursor.execute.side_effect = [None, RuntimeError("boom")]
-        conn.cursor.return_value = cursor
-
-        with pytest.raises(RuntimeError, match="boom"):
-            rule_engine.ensure_alert_dedup_schema(conn)
-
-        conn.rollback.assert_called_once()
-        cursor.close.assert_called_once()
-
-
 class TestRuleExecution:
     def test_execute_rule_returns_summary_on_success(self):
         cursor = MagicMock()
@@ -90,3 +64,32 @@ class TestRuleExecution:
         assert summary["alerts_created"] == 8
         assert summary["rules_executed"] == 6
         assert summary["error_count"] == 1
+
+
+class TestRuntimeSchemaValidation:
+    def test_mode_historical_validates_schema_before_running(self):
+        conn = MagicMock()
+        cursor = MagicMock()
+        conn.cursor.return_value = cursor
+
+        with patch.object(rule_engine, "connect", return_value=conn), patch.object(
+            rule_engine, "assert_rule_engine_schema"
+        ) as assert_schema, patch.object(
+            rule_engine,
+            "run_once",
+            return_value={
+                "alerts_created": 2,
+                "rules_executed": 6,
+                "error_count": 0,
+                "rules_duration_seconds": 0.1,
+                "results": [],
+            },
+        ) as run_once, patch.object(rule_engine, "_finalize_cycle") as finalize_cycle:
+            rule_engine.mode_historical(7)
+
+        assert_schema.assert_called_once_with(conn)
+        run_once.assert_called_once_with(cursor, "7 days", "HISTORICAL")
+        conn.commit.assert_called_once()
+        finalize_cycle.assert_called_once()
+        cursor.close.assert_called_once()
+        conn.close.assert_called_once()

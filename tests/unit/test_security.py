@@ -23,7 +23,9 @@ def app():
         "RATELIMIT_LOGIN": "5 per minute",
     }
     with patch.dict("os.environ", env, clear=False):
-        with patch("src.flask_app.app.PrometheusMetrics") as metrics_cls:
+        with patch("src.flask_app.app.PrometheusMetrics") as metrics_cls, patch(
+            "src.flask_app.app.validate_incident_workflow_schema"
+        ):
             metrics_cls.return_value.info = MagicMock()
             from src.flask_app.app import create_app
 

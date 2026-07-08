@@ -158,17 +158,20 @@ def render_alerts_page() -> None:
             st.subheader("Related logs")
             st.dataframe(_to_frame(related_logs), use_container_width=True, hide_index=True)
 
-        st.subheader("LIME explanation")
         available_log_ids = detail.get("log_ids") or []
+        st.subheader("Alert-level explainability")
         if not available_log_ids:
-            render_empty("No related logs are available for LIME explanation.")
+            render_empty("No related logs are available for local explainability.")
         else:
             explanation_log_id = st.selectbox(
                 "Explain related log",
                 options=available_log_ids,
-                key=f"lime-log-{detail['id']}",
+                key=f"explain-log-{detail['id']}",
                 format_func=lambda value: f"Log #{value}",
             )
+
+            st.caption("Local explainability currently targets the supervised Random Forest view of this alert context.")
+            st.subheader("LIME explanation")
             explanation = data.fetch_alert_explanation(int(detail["id"]), int(explanation_log_id))
             if explanation.get("status") != "ok":
                 render_empty(explanation.get("message", "LIME explanation is unavailable for this alert."))
@@ -188,6 +191,30 @@ def render_alerts_page() -> None:
                 else:
                     st.dataframe(
                         explanation_frame[["rank", "feature", "value", "weight", "direction", "rule"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            st.subheader("Counterfactual explanation")
+            counterfactual = data.fetch_alert_counterfactual(int(detail["id"]), int(explanation_log_id))
+            if counterfactual.get("status") != "ok":
+                render_empty(counterfactual.get("message", "Counterfactual explanation is unavailable for this alert."))
+            else:
+                cf1, cf2, cf3 = st.columns(3)
+                cf1.metric("Current anomaly prob.", f"{counterfactual['anomaly_probability']:.3f}")
+                cf2.metric("Counterfactual prob.", f"{counterfactual['counterfactual_anomaly_probability']:.3f}")
+                cf3.metric("Changed features", counterfactual.get("changed_feature_count", 0))
+                st.caption(
+                    f"Goal label: {counterfactual['counterfactual_label']} | "
+                    f"Feature source: {counterfactual['feature_source']} | "
+                    f"Reference pool: {counterfactual['reference_label_source']}"
+                )
+                counterfactual_frame = _to_frame(counterfactual.get("changed_features", []))
+                if counterfactual_frame.empty:
+                    render_empty("No feature changes were required for the current counterfactual path.")
+                else:
+                    st.dataframe(
+                        counterfactual_frame[["rank", "feature", "current_value", "counterfactual_value", "delta", "updated_anomaly_probability"]],
                         use_container_width=True,
                         hide_index=True,
                     )

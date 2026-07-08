@@ -11,6 +11,7 @@ import streamlit as st
 from psycopg2.extras import RealDictCursor
 
 from src.dashboard.config import get_config
+from src.ml.counterfactual_explainer import CounterfactualAlertExplainer
 from src.ml.lime_explainer import LimeAlertExplainer, LimeUnavailableError
 
 REQUEST_TIMEOUT_SECONDS = 5
@@ -167,6 +168,11 @@ def fetch_overview_snapshot() -> dict[str, Any]:
 @st.cache_resource(show_spinner=False)
 def get_lime_explainer() -> LimeAlertExplainer:
     return LimeAlertExplainer()
+
+
+@st.cache_resource(show_spinner=False)
+def get_counterfactual_explainer() -> CounterfactualAlertExplainer:
+    return CounterfactualAlertExplainer()
 
 
 def _fetch_alert_options() -> dict[str, list[str]]:
@@ -567,6 +573,47 @@ def fetch_alert_explanation(alert_id: int, log_id: int | None = None, top_k: int
     return _fetch_alert_explanation(alert_id, log_id, top_k)
 
 
+def _fetch_alert_counterfactual(alert_id: int, log_id: int | None = None) -> dict[str, Any]:
+    detail = _fetch_alert_detail(alert_id)
+    if not detail:
+        return {"status": "unavailable", "message": f"Alert {alert_id} could not be loaded."}
+
+    available_log_ids = [int(value) for value in (detail.get("log_ids") or [])]
+    if not available_log_ids:
+        return {"status": "unavailable", "message": "No related log IDs are attached to this alert."}
+
+    target_log_id = int(log_id or available_log_ids[0])
+    if target_log_id not in available_log_ids:
+        return {
+            "status": "unavailable",
+            "message": f"Log {target_log_id} is not attached to alert {alert_id}.",
+        }
+
+    context_rows = _fetch_log_context_window(target_log_id)
+    raw_context = pd.DataFrame(context_rows) if context_rows else pd.DataFrame()
+
+    try:
+        explanation = get_counterfactual_explainer().explain_log(
+            target_log_id,
+            raw_log_context=raw_context if not raw_context.empty else None,
+        )
+    except (LookupError, FileNotFoundError, ValueError) as exc:
+        return {"status": "unavailable", "message": str(exc), "log_id": target_log_id}
+
+    return {
+        "status": "ok",
+        "alert_id": int(alert_id),
+        "available_log_ids": available_log_ids,
+        "context_rows": int(len(raw_context)),
+        **explanation,
+    }
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_alert_counterfactual(alert_id: int, log_id: int | None = None) -> dict[str, Any]:
+    return _fetch_alert_counterfactual(alert_id, log_id)
+
+
 def clear_dashboard_caches() -> None:
     fetch_overview_snapshot.clear()
     fetch_alert_options.clear()
@@ -581,5 +628,7 @@ def clear_dashboard_caches() -> None:
     fetch_alert_trend.clear()
     fetch_ml_f1_history.clear()
     fetch_alert_explanation.clear()
+    fetch_alert_counterfactual.clear()
     get_lime_explainer.clear()
+    get_counterfactual_explainer.clear()
 

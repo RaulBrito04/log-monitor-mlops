@@ -28,7 +28,9 @@ def app():
         "DEMO_ANALYST_PASS": "analyst99",
     }
     with patch.dict("os.environ", env, clear=False):
-        with patch("src.flask_app.app.PrometheusMetrics") as metrics_cls:
+        with patch("src.flask_app.app.PrometheusMetrics") as metrics_cls, patch(
+            "src.flask_app.app.validate_incident_workflow_schema"
+        ):
             metrics_cls.return_value.info = MagicMock()
             app = create_app()
     app.config.update({"TESTING": True, "LOG_FILE": "/tmp/test_app.log"})
@@ -441,3 +443,20 @@ class TestIncidentLifecycleHelper:
         assert cursor.execute.call_count == 1
         conn.commit.assert_not_called()
 
+
+class TestApiContract:
+    def test_openapi_json_returns_core_paths(self, client):
+        response = client.get('/openapi.json')
+
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload['openapi'] == '3.1.0'
+        assert '/health' in payload['paths']
+        assert '/api/alerts/feedback' in payload['paths']
+        assert '/api/alerts/incident' in payload['paths']
+
+    def test_api_docs_page_returns_html(self, client):
+        response = client.get('/docs/api')
+
+        assert response.status_code == 200
+        assert 'SwaggerUIBundle' in response.get_data(as_text=True)

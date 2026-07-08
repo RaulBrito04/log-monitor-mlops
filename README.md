@@ -6,27 +6,25 @@
 [![Docker](https://img.shields.io/badge/docker-compose-2496ED.svg?logo=docker)](docker/docker-compose.yml)
 [![Security: Bandit](https://img.shields.io/badge/bandit-0%20HIGH%2F0%20MEDIUM-brightgreen.svg)](https://github.com/PyCQA/bandit)
 
-Sistema híbrido open-source de deteção de anomalias em logs de aplicações web, combinando regras SQL determinísticas com machine learning não-supervisionado e explicabilidade SHAP. Alternativa viável a SIEMs comerciais (€10k–€100k/ano) para PMEs e contexto académico.
+Sistema hibrido open-source de deteccao de anomalias em logs de aplicacoes web, combinando regras SQL deterministicas, machine learning hibrido, feedback humano e explicabilidade com SHAP, LIME e counterfactuals. Alternativa viavel a SIEMs comerciais (EUR10k-EUR100k/ano) para PMEs e contexto academico.
 
 ---
 
 ## Estado atual
 
-**Semana 15 de 23 — Goal C em curso**
+**Goal D fechado nesta fase com validacao operacional, feedback loop e fecho de entrega.**
 
-| Componente | Estado | Métrica |
+| Componente | Estado | Evidencia principal |
 |---|---|---|
-| Ingestão de logs | Operacional | 10.933 logs/s (batch=500) |
-| Rule Engine SQL | Operacional | 6 regras, 0 falsos positivos, 7–41 ms/regra |
-| ML Pipeline híbrido | Operacional | F1=0,838 (IF) · F1=0,783 (RF) · ROC-AUC=0,950 |
-| Explicabilidade SHAP | Operacional | Por alerta, em `experiments/` |
-| Monitorização | Operacional | Prometheus + Grafana + Alertmanager |
-| Dashboard operador | Operacional | Streamlit |
-| CI/CD | Operacional | GitHub Actions — Pylint, Bandit, Trivy, pytest |
-| Security hardening | Concluído (S14) | 0 HIGH/MEDIUM Bandit · 5 containers non-root |
-| Cobertura de testes | 70,97% | Limiar CI ≥70% cumprido |
-
----
+| Ingestao online | Operacional | JSON + Apache/Nginx/Web JSON |
+| Bulk/backfill | Operacional | `--insert-method copy` para cargas offline |
+| Rule Engine SQL | Operacional | 6 regras + deduplicacao + disciplina de migrations |
+| ML hibrido | Operacional | IF + RF + retraining assistido com feedback |
+| Explicabilidade | Operacional | SHAP + LIME + counterfactuals locais |
+| Dashboard operador | Operacional | Alertas, incidente, feedback, explicacoes |
+| API contratual | Operacional | `/openapi.json` + `/docs/api` |
+| Monitorizacao | Operacional | Prometheus + Grafana + Alertmanager + metricas ML |
+| Qualidade final | Verificada | `183` testes unit/app + `2` integracao + Alembic + Compose |
 
 ## Arranque rápido
 
@@ -50,12 +48,19 @@ docker compose -f docker/docker-compose.yml ps
 ```
 **Nota:** o servico `db-migrate` e um job one-shot; aplica as migrations Alembic e termina com codigo `0` por design.
 
+**Gate final local:**
+
+```bash
+bash scripts/run_final_quality_gate.sh
+```
+
 
 **Interfaces disponíveis após arranque:**
 
 | Serviço | URL |
 |---|---|
 | Flask app | http://localhost:5001 |
+| API docs | http://localhost:5001/docs/api |
 | Streamlit dashboard | http://localhost:8501 |
 | Grafana | http://localhost:3000 |
 | Prometheus | http://localhost:9090 |
@@ -114,9 +119,11 @@ docker compose -f docker/docker-compose.yml ps
 **Random Forest** (supervisionado — padrões conhecidos)
 - F1=0,783 em holdout temporal
 
-**Ablation study** confirma que o ensemble híbrido supera qualquer componente isolado em F1-score.
+**Ablation study** confirma que o ensemble hibrido supera qualquer componente isolado em F1-score no dataset interno.
 
-**MLflow** regista cada run de treino: parâmetros, métricas, artefactos — auditabilidade completa do modelo.
+**MLflow** regista cada run de treino: parametros, metricas, artefactos - auditabilidade completa do modelo.
+
+**Human-in-the-loop** ja suporta recolha de feedback no dashboard/API e geracao de dataset revisto para retraining assistido.
 
 ---
 
@@ -184,21 +191,28 @@ Summary       →  relatório no GitHub
 
 ---
 
-## Stack tecnológico
+## Stack tecnologico
 
 | Camada | Tecnologias |
 |---|---|
-| Aplicação | Python 3.12 · Flask · Pydantic · Flask-Limiter |
+| Aplicacao | Python 3.12, Flask, Pydantic, Flask-Limiter |
 | Armazenamento | PostgreSQL 16 / TimescaleDB / SQLAlchemy / Alembic |
-| ML | Scikit-learn · Isolation Forest · Random Forest · SHAP |
-| MLOps | MLflow · Joblib |
-| Containers | Docker · Docker Compose · multi-stage builds |
-| Monitorização | Prometheus · Grafana · Alertmanager |
+| ML | Scikit-learn, Isolation Forest, Random Forest, SHAP, LIME |
+| MLOps | MLflow, Joblib |
+| Containers | Docker, Docker Compose, multi-stage builds |
+| Monitorizacao | Prometheus, Grafana, Alertmanager |
 | Dashboard | Streamlit |
-| CI/CD | GitHub Actions · Bandit · Pylint · Trivy · Dependabot |
-| Testes | pytest · Locust (load testing) |
+| Contrato API | OpenAPI 3.1, Swagger UI |
+| CI/CD | GitHub Actions, Bandit, Pylint, Trivy, Dependabot |
+| Testes | pytest, Locust (load testing) |
 
----
+## Evidencia de entrega
+
+- Indice consolidado: `docs/FINAL_EVIDENCE_INDEX.md`
+- Gate final e reprodutibilidade: `docs/FINAL_QUALITY_REPRO.md`
+- Contrato da API: `docs/API_CONTRACT.md`
+- Counterfactuals: `docs/COUNTERFACTUALS.md`
+- Bulk ingestion: `docs/BULK_INGESTION_MODE.md`
 
 ## Estrutura do projeto
 
