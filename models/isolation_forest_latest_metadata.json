@@ -1,6 +1,6 @@
 {
-  "threshold": 0.0949109030081742,
-  "saved_at": "2026-03-23T13:00:22.188141",
+  "threshold": 0.09451114017315063,
+  "saved_at": "2026-07-10T18:14:16.485133",
   "tracking_uri": "http://localhost:5000",
   "model_family": "isolation_forest",
   "train_on_normals_only": true,

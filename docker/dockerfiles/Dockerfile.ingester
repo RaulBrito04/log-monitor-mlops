@@ -14,6 +14,7 @@ RUN groupadd --gid 1001 appgroup \
 
 COPY --from=builder /install /usr/local
 COPY --chown=appuser:appgroup src/log_processor/ ./src/log_processor/
+COPY --chown=appuser:appgroup src/monitoring/ ./src/monitoring/
 COPY --chown=appuser:appgroup src/__init__.py ./src/__init__.py
 COPY --chown=appuser:appgroup .env.example ./.env
 

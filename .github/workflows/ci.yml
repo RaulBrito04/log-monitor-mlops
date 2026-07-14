@@ -112,6 +112,9 @@ jobs:
       - name: Create runtime directories
         run: mkdir -p reports models data experiments logs
 
+      - name: Alembic migration smoke check
+        run: alembic upgrade head
+
       - name: Pytest - unit and app suite
         run: |
           pytest tests/unit tests/test_flask_app.py tests/test_dashboard.py tests/test_mlflow.py \
@@ -120,7 +123,7 @@ jobs:
             --cov=src \
             --cov-report=xml:reports/coverage.xml \
             --cov-report=html:reports/coverage_html \
-            --cov-fail-under=70
+            --cov-fail-under=85
 
       - name: Pytest - integration
         run: |
@@ -220,6 +223,17 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build db-migrate image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/dockerfiles/Dockerfile.db-migrate
+          push: false
+          load: true
+          tags: logmonitor/db-migrate:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Create reports directory
         run: mkdir -p reports
 
@@ -256,6 +270,7 @@ jobs:
             echo "- logmonitor/ml-pipeline:ci"
             echo "- logmonitor/rule-engine:ci"
             echo "- logmonitor/ingester:ci"
+            echo "- logmonitor/db-migrate:ci"
           } >> "$GITHUB_STEP_SUMMARY"
 
   notify:

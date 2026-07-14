@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import psycopg2
 import pytest
@@ -18,13 +18,13 @@ def test_ingester_and_rule_engine_flow(test_db, clean_db, sample_logs, anomalous
 
     assert inserted == len(sample_logs) + len(anomalous_logs)
 
-    created_alerts = rule_engine.run_once(cursor, "365 days", "TEST")
+    summary = rule_engine.run_once(cursor, "365 days", "TEST")
     conn.commit()
 
     cursor.execute("SELECT alert_type, COUNT(*) FROM alerts GROUP BY alert_type")
     grouped = dict(cursor.fetchall())
 
-    assert created_alerts >= 2
+    assert summary["alerts_created"] >= 2
     assert grouped.get("brute_force", 0) >= 1
     assert grouped.get("sql_injection", 0) >= 1
 
@@ -118,3 +118,4 @@ def test_hybrid_pipeline_persists_scores_to_test_db(test_db, clean_db, monkeypat
     verify_cursor.close()
     verify_conn.close()
     pipeline.conn.close()
+

@@ -16,7 +16,9 @@ from pydantic import ValidationError
 from prometheus_flask_exporter import PrometheusMetrics
 from pythonjsonlogger import jsonlogger
 
+from src.db.schema_checks import assert_incident_workflow_schema
 from src.flask_app.config import AppConfig, get_demo_users
+from src.flask_app.openapi import build_openapi_spec, build_swagger_ui_html
 from src.flask_app.limiter import init_limiter, limiter
 from src.flask_app.security import add_cache_headers, init_security_headers
 from src.flask_app.validators import (
@@ -159,46 +161,9 @@ ALLOWED_INCIDENT_TRANSITIONS = {
 }
 
 
-def _ensure_incident_workflow_schema() -> None:
+def validate_incident_workflow_schema() -> None:
     with _db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS incident_status VARCHAR(20) DEFAULT 'NEW'")
-            cursor.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS incident_owner VARCHAR(100)")
-            cursor.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS incident_notes TEXT")
-            cursor.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS incident_updated_at TIMESTAMPTZ DEFAULT NOW()")
-            cursor.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS incident_updated_by VARCHAR(100)")
-            cursor.execute(
-                """
-                UPDATE alerts
-                SET incident_status = COALESCE(incident_status, 'NEW'),
-                    incident_updated_at = COALESCE(incident_updated_at, created_at, NOW())
-                WHERE incident_status IS NULL OR incident_updated_at IS NULL
-                """
-            )
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_incident_status ON alerts(incident_status)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_incident_owner ON alerts(incident_owner)")
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS alert_incident_history (
-                    id SERIAL PRIMARY KEY,
-                    alert_id INTEGER REFERENCES alerts(id) ON DELETE CASCADE,
-                    previous_status VARCHAR(20),
-                    new_status VARCHAR(20) NOT NULL CHECK (new_status IN ('NEW', 'INVESTIGATING', 'RESOLVED')),
-                    previous_owner VARCHAR(100),
-                    new_owner VARCHAR(100),
-                    change_notes TEXT,
-                    changed_by VARCHAR(100),
-                    changed_at TIMESTAMPTZ DEFAULT NOW()
-                )
-                """
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_alert_incident_history_alert_id ON alert_incident_history(alert_id)"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_alert_incident_history_changed_at ON alert_incident_history(changed_at DESC)"
-            )
-        conn.commit()
+        assert_incident_workflow_schema(conn)
 
 
 def _persist_feedback(alert_id: int, user_id: str, label: str, reason: str) -> tuple[int, datetime]:
@@ -325,10 +290,7 @@ def create_app() -> Flask:
     init_security_headers(app)
     add_cache_headers(app)
     init_limiter(app)
-    try:
-        _ensure_incident_workflow_schema()
-    except psycopg2.Error as exc:
-        logger.warning('Incident workflow schema sync skipped: %s', exc)
+    validate_incident_workflow_schema()
 
     @app.before_request
     def before_request() -> None:
@@ -380,6 +342,15 @@ def create_app() -> Flask:
     @app.route("/health", methods=["GET"])
     def health_check() -> tuple[Response, int]:
         return jsonify({"status": "healthy", "version": APP_VERSION}), 200
+
+    @app.route("/openapi.json", methods=["GET"])
+    def openapi_spec() -> tuple[Response, int]:
+        host = request.host_url.rstrip("/")
+        return jsonify(build_openapi_spec(version=APP_VERSION, server_url=host)), 200
+
+    @app.route("/docs/api", methods=["GET"])
+    def api_docs() -> Response:
+        return Response(build_swagger_ui_html(spec_path="/openapi.json"), mimetype="text/html")
 
     @app.route("/metrics/ml_quality", methods=["POST"])
     def update_ml_quality() -> tuple[Response, int]:

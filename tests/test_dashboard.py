@@ -362,6 +362,51 @@ def test_render_alerts_page_smoke(monkeypatch):
         },
     )
     monkeypatch.setattr(pages_impl.data, "fetch_logs_for_ids", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        pages_impl.data,
+        "fetch_alert_explanation",
+        lambda *args, **kwargs: {
+            "status": "ok",
+            "model_family": "random_forest",
+            "feature_source": "dataset",
+            "log_id": 1001,
+            "context_rows": 12,
+            "anomaly_probability": 0.82,
+            "top_features": [
+                {
+                    "rank": 1,
+                    "feature": "response_time_ms",
+                    "value": 240.0,
+                    "weight": 0.31,
+                    "direction": "pushes_anomaly",
+                    "rule": "response_time_ms > 200",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        pages_impl.data,
+        "fetch_alert_counterfactual",
+        lambda *args, **kwargs: {
+            "status": "ok",
+            "feature_source": "dataset",
+            "reference_label_source": "actual_label_and_model",
+            "anomaly_probability": 0.82,
+            "counterfactual_anomaly_probability": 0.21,
+            "counterfactual_label": "normal",
+            "changed_feature_count": 2,
+            "changed_features": [
+                {
+                    "rank": 1,
+                    "feature": "response_time_ms",
+                    "current_value": 240.0,
+                    "counterfactual_value": 35.0,
+                    "delta": -205.0,
+                    "updated_anomaly_probability": 0.44,
+                }
+            ],
+        },
+    )
     monkeypatch.setattr(pages_impl.data, "fetch_feedback_history", lambda *args, **kwargs: [])
     monkeypatch.setattr(pages_impl.data, "fetch_incident_history", lambda *args, **kwargs: [])
 
@@ -428,3 +473,118 @@ def test_render_model_monitoring_page_smoke(monkeypatch):
     pages_impl.render_model_monitoring_page()
 
 
+
+
+def test_fetch_alert_explanation_returns_unavailable_without_log_ids(monkeypatch):
+    monkeypatch.setattr(data, '_fetch_alert_detail', lambda alert_id: {'id': alert_id, 'log_ids': []})
+
+    result = data._fetch_alert_explanation(9)
+
+    assert result['status'] == 'unavailable'
+    assert 'No related log IDs' in result['message']
+
+
+def test_fetch_alert_explanation_uses_selected_log(monkeypatch):
+    monkeypatch.setattr(data, '_fetch_alert_detail', lambda alert_id: {'id': alert_id, 'log_ids': [11, 12]})
+    monkeypatch.setattr(
+        data,
+        '_fetch_log_context_window',
+        lambda log_id, limit=250: [
+            {
+                'id': log_id,
+                'timestamp': pd.Timestamp('2026-04-13T12:00:00Z'),
+                'ip': '10.0.0.5',
+                'method': 'GET',
+                'endpoint': '/search?q=test',
+                'status': 200,
+                'response_time_ms': 30.0,
+                'user_agent': 'pytest',
+                'data': {},
+            }
+        ],
+    )
+
+    captured = {}
+
+    class FakeExplainer:
+        def explain_log(self, log_id, raw_log_context=None, top_k=8):
+            captured['log_id'] = log_id
+            captured['rows'] = 0 if raw_log_context is None else len(raw_log_context)
+            captured['top_k'] = top_k
+            return {
+                'model_family': 'random_forest',
+                'feature_source': 'dataset',
+                'log_id': log_id,
+                'anomaly_probability': 0.77,
+                'predicted_label': 'anomaly',
+                'top_features': [],
+            }
+
+    monkeypatch.setattr(data, 'get_lime_explainer', lambda: FakeExplainer())
+
+    result = data._fetch_alert_explanation(4, 12, 6)
+
+    assert result['status'] == 'ok'
+    assert result['log_id'] == 12
+    assert result['context_rows'] == 1
+    assert captured == {'log_id': 12, 'rows': 1, 'top_k': 6}
+
+
+def test_fetch_alert_counterfactual_returns_unavailable_without_log_ids(monkeypatch):
+    monkeypatch.setattr(data, '_fetch_alert_detail', lambda alert_id: {'id': alert_id, 'log_ids': []})
+
+    result = data._fetch_alert_counterfactual(9)
+
+    assert result['status'] == 'unavailable'
+    assert 'No related log IDs' in result['message']
+
+
+def test_fetch_alert_counterfactual_uses_selected_log(monkeypatch):
+    monkeypatch.setattr(data, '_fetch_alert_detail', lambda alert_id: {'id': alert_id, 'log_ids': [11, 12]})
+    monkeypatch.setattr(
+        data,
+        '_fetch_log_context_window',
+        lambda log_id, limit=250: [
+            {
+                'id': log_id,
+                'timestamp': pd.Timestamp('2026-04-13T12:00:00Z'),
+                'ip': '10.0.0.5',
+                'method': 'GET',
+                'endpoint': '/search?q=test',
+                'status': 200,
+                'response_time_ms': 30.0,
+                'user_agent': 'pytest',
+                'data': {},
+            }
+        ],
+    )
+
+    captured = {}
+
+    class FakeCounterfactualExplainer:
+        def explain_log(self, log_id, raw_log_context=None):
+            captured['log_id'] = log_id
+            captured['rows'] = 0 if raw_log_context is None else len(raw_log_context)
+            return {
+                'model_family': 'random_forest',
+                'feature_source': 'dataset',
+                'reference_label_source': 'actual_label_and_model',
+                'log_id': log_id,
+                'predicted_label': 'anomaly',
+                'anomaly_probability': 0.77,
+                'counterfactual_label': 'normal',
+                'counterfactual_anomaly_probability': 0.22,
+                'counterfactual_found': True,
+                'nearest_reference_distance': 0.3,
+                'changed_feature_count': 1,
+                'changed_features': [],
+            }
+
+    monkeypatch.setattr(data, 'get_counterfactual_explainer', lambda: FakeCounterfactualExplainer())
+
+    result = data._fetch_alert_counterfactual(4, 12)
+
+    assert result['status'] == 'ok'
+    assert result['log_id'] == 12
+    assert result['context_rows'] == 1
+    assert captured == {'log_id': 12, 'rows': 1}

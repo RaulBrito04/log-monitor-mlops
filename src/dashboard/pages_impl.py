@@ -15,6 +15,18 @@ def _to_frame(rows: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
+def _display_label(value: object) -> str:
+    if value is None or value == "":
+        return "-"
+    return str(value).replace("_", " ").strip().title()
+
+
+def _display_severity(value: object) -> str:
+    if value is None or value == "":
+        return "-"
+    return str(value).upper()
+
+
 def _maybe_autorefresh(page_key: str, enabled: bool) -> None:
     if enabled:
         config = get_config()
@@ -89,11 +101,29 @@ def render_alerts_page() -> None:
         return
 
     f1, f2, f3, f4, f5, f6 = st.columns(6)
-    severity = f1.selectbox("Severity", ["ALL", *options.get("severities", [])])
-    alert_type = f2.selectbox("Alert type", ["ALL", *options.get("types", [])])
-    source = f3.selectbox("Source", ["ALL", *options.get("sources", [])])
-    incident_status = f4.selectbox("Incident status", ["ALL", *options.get("statuses", [])])
-    hours = f5.selectbox("Time window", [1, 6, 24, 72], index=2)
+    severity = f1.selectbox(
+        "Severity",
+        ["ALL", *options.get("severities", [])],
+        format_func=lambda value: "All" if value == "ALL" else _display_severity(value),
+    )
+    alert_type = f2.selectbox(
+        "Alert type",
+        ["ALL", *options.get("types", [])],
+        format_func=lambda value: "All" if value == "ALL" else _display_label(value),
+    )
+    source = f3.selectbox(
+        "Source",
+        ["ALL", *options.get("sources", [])],
+        format_func=lambda value: "All" if value == "ALL" else _display_label(value),
+    )
+    incident_status = f4.selectbox(
+        "Incident status",
+        ["ALL", *options.get("statuses", [])],
+        format_func=lambda value: "All" if value == "ALL" else _display_label(value),
+    )
+    time_windows = [1, 6, 24, 72, 168, 720]
+    time_labels = {1: "1 hour", 6: "6 hours", 24: "24 hours", 72: "3 days", 168: "7 days", 720: "30 days"}
+    hours = f5.selectbox("Time window", time_windows, index=2, format_func=time_labels.get)
     ip_query = f6.text_input("IP contains")
 
     try:
@@ -108,16 +138,36 @@ def render_alerts_page() -> None:
         render_empty("No alerts matched the selected filters.")
         return
 
-    st.dataframe(
-        alerts_frame[["id", "alert_type", "severity", "source", "incident_status", "incident_owner", "ip", "timestamp", "related_logs", "confidence"]],
-        use_container_width=True,
-        hide_index=True,
+    display_frame = alerts_frame[
+        ["id", "alert_type", "severity", "source", "incident_status", "incident_owner", "ip", "timestamp", "related_logs", "confidence"]
+    ].copy()
+    display_frame["alert_type"] = display_frame["alert_type"].map(_display_label)
+    display_frame["severity"] = display_frame["severity"].map(_display_severity)
+    display_frame["source"] = display_frame["source"].map(_display_label)
+    display_frame["incident_status"] = display_frame["incident_status"].map(_display_label)
+    display_frame = display_frame.rename(
+        columns={
+            "id": "Alert ID",
+            "alert_type": "Alert type",
+            "severity": "Severity",
+            "source": "Source",
+            "incident_status": "Incident status",
+            "incident_owner": "Incident owner",
+            "ip": "IP",
+            "timestamp": "Timestamp",
+            "related_logs": "Related logs",
+            "confidence": "Confidence",
+        }
     )
+    st.dataframe(display_frame, use_container_width=True, hide_index=True)
 
     selected_alert_id = st.selectbox(
         "Alert detail",
         options=alerts_frame["id"].tolist(),
-        format_func=lambda value: f"Alert #{value} - {alerts_frame.loc[alerts_frame['id'] == value, 'alert_type'].iloc[0]}",
+        format_func=lambda value: (
+            f"Alert #{value} - "
+            f"{_display_label(alerts_frame.loc[alerts_frame['id'] == value, 'alert_type'].iloc[0])}"
+        ),
     )
 
     try:
@@ -157,6 +207,67 @@ def render_alerts_page() -> None:
         if related_logs:
             st.subheader("Related logs")
             st.dataframe(_to_frame(related_logs), use_container_width=True, hide_index=True)
+
+        available_log_ids = detail.get("log_ids") or []
+        st.subheader("Alert-level explainability")
+        if not available_log_ids:
+            render_empty("No related logs are available for local explainability.")
+        else:
+            explanation_log_id = st.selectbox(
+                "Explain related log",
+                options=available_log_ids,
+                key=f"explain-log-{detail['id']}",
+                format_func=lambda value: f"Log #{value}",
+            )
+
+            st.caption("Local explainability currently targets the supervised Random Forest view of this alert context.")
+            st.subheader("LIME explanation")
+            explanation = data.fetch_alert_explanation(int(detail["id"]), int(explanation_log_id))
+            if explanation.get("status") != "ok":
+                render_empty(explanation.get("message", "LIME explanation is unavailable for this alert."))
+            else:
+                exp1, exp2, exp3 = st.columns(3)
+                exp1.metric("RF anomaly probability", f"{explanation['anomaly_probability']:.3f}")
+                exp2.metric("Explained log", explanation["log_id"])
+                exp3.metric("Context rows", explanation.get("context_rows", 0))
+                st.caption(
+                    f"Model: {explanation['model_family']} | "
+                    f"Feature source: {explanation['feature_source']} | "
+                    "Explanation target: anomaly class"
+                )
+                explanation_frame = _to_frame(explanation.get("top_features", []))
+                if explanation_frame.empty:
+                    render_empty("LIME did not return any local feature contributions for this alert.")
+                else:
+                    st.dataframe(
+                        explanation_frame[["rank", "feature", "value", "weight", "direction", "rule"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            st.subheader("Counterfactual explanation")
+            counterfactual = data.fetch_alert_counterfactual(int(detail["id"]), int(explanation_log_id))
+            if counterfactual.get("status") != "ok":
+                render_empty(counterfactual.get("message", "Counterfactual explanation is unavailable for this alert."))
+            else:
+                cf1, cf2, cf3 = st.columns(3)
+                cf1.metric("Current anomaly prob.", f"{counterfactual['anomaly_probability']:.3f}")
+                cf2.metric("Counterfactual prob.", f"{counterfactual['counterfactual_anomaly_probability']:.3f}")
+                cf3.metric("Changed features", counterfactual.get("changed_feature_count", 0))
+                st.caption(
+                    f"Goal label: {counterfactual['counterfactual_label']} | "
+                    f"Feature source: {counterfactual['feature_source']} | "
+                    f"Reference pool: {counterfactual['reference_label_source']}"
+                )
+                counterfactual_frame = _to_frame(counterfactual.get("changed_features", []))
+                if counterfactual_frame.empty:
+                    render_empty("No feature changes were required for the current counterfactual path.")
+                else:
+                    st.dataframe(
+                        counterfactual_frame[["rank", "feature", "current_value", "counterfactual_value", "delta", "updated_anomaly_probability"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
         st.subheader("Feedback history")
         try:

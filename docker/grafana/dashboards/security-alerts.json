@@ -5,23 +5,23 @@
   "panels": [
     {
       "type": "stat",
-      "title": "Critical Alerts (24h)",
+      "title": "Active Critical Alerts",
       "gridPos": {"x": 0, "y": 0, "w": 8, "h": 4},
-      "targets": [{"expr": "sum(logmonitor_active_alerts{severity=\"CRITICAL\"})", "refId": "A"}],
+      "targets": [{"expr": "sum(logmonitor_active_alerts{severity=\"CRITICAL\"}) or vector(0)", "refId": "A"}],
       "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "value"}
     },
     {
       "type": "stat",
-      "title": "High Alerts (24h)",
+      "title": "Active High Alerts",
       "gridPos": {"x": 8, "y": 0, "w": 8, "h": 4},
-      "targets": [{"expr": "sum(logmonitor_active_alerts{severity=\"HIGH\"})", "refId": "A"}],
+      "targets": [{"expr": "sum(logmonitor_active_alerts{severity=\"HIGH\"}) or vector(0)", "refId": "A"}],
       "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "value"}
     },
     {
       "type": "stat",
-      "title": "Warning Alerts (24h)",
+      "title": "Active Medium Alerts",
       "gridPos": {"x": 16, "y": 0, "w": 8, "h": 4},
-      "targets": [{"expr": "sum(logmonitor_active_alerts{severity=\"MEDIUM\"})", "refId": "A"}],
+      "targets": [{"expr": "sum(logmonitor_active_alerts{severity=\"MEDIUM\"}) or vector(0)", "refId": "A"}],
       "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "value"}
     },
     {

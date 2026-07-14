@@ -14,7 +14,7 @@
       "type": "stat",
       "title": "Alerts (24h)",
       "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
-      "targets": [{"expr": "sum(increase(logmonitor_alerts_total[24h]))", "refId": "A"}],
+      "targets": [{"expr": "sum(increase(logmonitor_alerts_total[24h])) or vector(0)", "refId": "A"}],
       "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "value"}
     },
     {

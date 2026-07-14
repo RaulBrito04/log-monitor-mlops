@@ -1,0 +1,18 @@
+{
+    email {$CADDY_EMAIL}
+}
+
+{$API_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy flask-app:5001
+}
+
+{$DASHBOARD_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy dashboard:8501
+}
+
+{$GRAFANA_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy grafana:3000
+}

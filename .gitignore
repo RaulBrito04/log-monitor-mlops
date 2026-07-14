@@ -1,5 +1,6 @@
 # Environment
 .env
+.env.cloud
 docker/.env
 
 # Python
@@ -43,3 +44,5 @@ reports/
 .claude/
 docs/Copy Desktop overview/
 docs/ROADMAP_post_intermedio_work.md
+tmp/
+~$*.docx

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import time
@@ -22,6 +22,45 @@ class TestRuntimeMetricsPersistence:
         assert saved["ml_f1_score"] == 0.82
         assert saved["dataset"] == "holdout"
 
+    def test_persist_component_runtime_metrics_stores_snapshot_and_updates_throughput_gauge(self, tmp_path, monkeypatch):
+        runtime_file = tmp_path / "runtime_metrics.json"
+        monkeypatch.setattr(metrics, "RUNTIME_METRICS_FILE", runtime_file)
+
+        saved = metrics.persist_component_runtime_metrics(
+            "ingester",
+            {
+                "duration_seconds": 1.25,
+                "throughput_logs_per_second": 320.5,
+                "logs_ingested": 400,
+            },
+        )
+
+        assert "throughput_components" in saved
+        assert saved["throughput_components"]["ingester"]["logs_ingested"] == 400
+        assert saved["throughput_components"]["ingester"]["recorded_at"]
+        assert metrics.PIPELINE_COMPONENT_THROUGHPUT.labels(component="ingester")._value.get() == 320.5
+
+
+class TestPipelineStageMetrics:
+    def test_observe_pipeline_stage_updates_latest_gauges_and_counter(self):
+        error_metric = metrics.PIPELINE_STAGE_ERRORS_TOTAL.labels(component="ingester", stage="parse_batch")
+        initial_errors = error_metric._value.get()
+
+        metrics.observe_pipeline_stage(
+            "ingester",
+            "parse_batch",
+            0.25,
+            batch_size=128,
+            row_count=120,
+            error_count=2,
+        )
+
+        duration_metric = metrics.PIPELINE_STAGE_DURATION.labels(component="ingester", stage="parse_batch")
+        assert duration_metric._sum.get() >= 0.25
+        assert metrics.PIPELINE_STAGE_BATCH_SIZE.labels(component="ingester", stage="parse_batch")._value.get() == 128
+        assert metrics.PIPELINE_STAGE_ROW_COUNT.labels(component="ingester", stage="parse_batch")._value.get() == 120
+        assert error_metric._value.get() == initial_errors + 2
+
 
 class TestMonitoringRefresh:
     def test_refresh_monitoring_metrics_populates_gauges(self, mocker):
@@ -30,6 +69,7 @@ class TestMonitoringRefresh:
         metrics.ACTIVE_ALERTS.clear()
         metrics.INCIDENT_ALERTS_TOTAL.clear()
         metrics.ML_PREDICTIONS_TOTAL.clear()
+        metrics.PIPELINE_COMPONENT_THROUGHPUT.clear()
 
         cursor = mocker.Mock()
         conn = mocker.Mock()
@@ -61,6 +101,9 @@ class TestMonitoringRefresh:
                 "retraining_reviewed_f1_delta": -0.03,
                 "retraining_temporal_f1_delta": -0.02,
                 "retraining_temporal_precision_delta": -0.01,
+                "throughput_components": {
+                    "ingester": {"throughput_logs_per_second": 250.0},
+                },
             },
         )
         info = mocker.patch.object(metrics.MONITORING_INFO, "info")
@@ -79,6 +122,7 @@ class TestMonitoringRefresh:
         assert metrics.ML_RETRAINING_REVIEWED_F1_DELTA._value.get() == -0.03
         assert metrics.ML_RETRAINING_TEMPORAL_F1_DELTA._value.get() == -0.02
         assert metrics.ML_RETRAINING_TEMPORAL_PRECISION_DELTA._value.get() == -0.01
+        assert metrics.PIPELINE_COMPONENT_THROUGHPUT.labels(component="ingester")._value.get() == 250.0
         assert metrics.DATA_FRESHNESS_SECONDS._value.get() == 42.0
         info.assert_called_once()
         conn.close.assert_called_once()

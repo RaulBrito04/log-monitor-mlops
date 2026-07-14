@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 import os
 import pickle
 import json
+from collections import Counter
 from datetime import datetime
 import warnings
 
@@ -33,11 +34,12 @@ DEFAULT_LOOKBACK_DAYS = int(os.getenv('FEATURE_LOOKBACK_DAYS', '90'))
 class FeatureEngineer:
     """Pipeline completo de feature engineering para anomaly detection"""
     
-    def __init__(self):
+    def __init__(self, connect_db=True):
         self.conn = None
         self.cursor = None
         self._setup_directories()
-        self._connect_db()
+        if connect_db:
+            self._connect_db()
     
     def _setup_directories(self):
         """Cria diretórios necessários"""
@@ -185,121 +187,105 @@ class FeatureEngineer:
         return features
     
     def _aggregation_features(self, df, features):
-        """Features de agregação por IP - janela 5min (6 features)"""
-        print("3. Extraindo features de agregação (janela 5min)...")
-        
-        # Criar janela de 5 minutos
-        df['time_window'] = pd.to_datetime(df['timestamp']).dt.floor('5min')
-        
-        # Agregações por IP + janela
-        agg = df.groupby(['ip', 'time_window']).agg({
-            'id': 'count',  # requests_per_ip_5min
-            'endpoint': 'nunique',  # unique_endpoints_5min
-            'status': lambda x: (x >= 400).sum() / len(x) if len(x) > 0 else 0,  # failed_ratio
-            'response_time_ms': ['mean', 'max']
-        }).reset_index()
-        
-        agg.columns = ['ip', 'time_window', 'requests_per_ip_5min', 
-                      'unique_endpoints_5min', 'failed_requests_ratio_5min',
-                      'avg_response_time_5min', 'max_response_time_5min']
-        
-        # Merge com dataframe original
-        df = df.merge(agg, on=['ip', 'time_window'], how='left')
-        
-        # Request rate (requests/segundo)
-        features['requests_per_ip_5min'] = df['requests_per_ip_5min'].fillna(1)
-        features['unique_endpoints_5min'] = df['unique_endpoints_5min'].fillna(1)
-        features['failed_requests_ratio_5min'] = df['failed_requests_ratio_5min'].fillna(0)
-        features['avg_response_time_5min'] = df['avg_response_time_5min'].fillna(df['response_time_ms'])
-        features['max_response_time_5min'] = df['max_response_time_5min'].fillna(df['response_time_ms'])
-        features['request_rate_5min'] = features['requests_per_ip_5min'] / 300  # 5min = 300s
-        
-        print(f"   ✓ 6 features de agregação")
+        """Features de agregacao por IP - janela 5min (6 features)"""
+        print("3. Extraindo features de agregacao (janela 5min)...")
+
+        time_window = df['timestamp'].dt.floor('5min')
+        group_keys = [df['ip'], time_window]
+
+        requests_per_ip = df.groupby(group_keys)['id'].transform('count')
+        unique_endpoints = df.groupby(group_keys)['endpoint'].transform('nunique')
+        failed_ratio = (df['status'] >= 400).astype(float).groupby(group_keys).transform('mean')
+        avg_response = df.groupby(group_keys)['response_time_ms'].transform('mean')
+        max_response = df.groupby(group_keys)['response_time_ms'].transform('max')
+
+        features['requests_per_ip_5min'] = requests_per_ip.fillna(1).astype(float)
+        features['unique_endpoints_5min'] = unique_endpoints.fillna(1).astype(float)
+        features['failed_requests_ratio_5min'] = failed_ratio.fillna(0.0).astype(float)
+        features['avg_response_time_5min'] = avg_response.fillna(df['response_time_ms']).astype(float)
+        features['max_response_time_5min'] = max_response.fillna(df['response_time_ms']).astype(float)
+        features['request_rate_5min'] = features['requests_per_ip_5min'] / 300.0
+
+        print("   OK 6 features de agregacao")
         return features
-    
+
     def _temporal_features(self, df, features):
         """Features temporais (4 features)"""
         print("4. Extraindo features temporais...")
-        
-        timestamps = pd.to_datetime(df['timestamp'])
-        
+
+        timestamps = df['timestamp']
+
         features['hour_of_day'] = timestamps.dt.hour.astype(float)
         features['day_of_week'] = timestamps.dt.dayofweek.astype(float)  # 0=Monday
        # features['is_weekend'] = (timestamps.dt.dayofweek >= 5).astype(float)
         features['is_night'] = ((timestamps.dt.hour >= 22) | (timestamps.dt.hour < 6)).astype(float)
-        
-        print(f"   ✓ 4 features temporais")
+
+        print("   OK 4 features temporais")
         return features
-    
+
     def _url_features(self, df, features):
         """Features de URL/endpoint (3 features)"""
         print("5. Extraindo features de URL...")
-        
-        features['endpoint_length'] = df['endpoint'].str.len().astype(float)
-        features['has_query_params'] = df['endpoint'].str.contains(r'\?', regex=True).astype(float)
+
+        endpoint_series = df['endpoint']
+        has_query_params = endpoint_series.str.contains(r'\?', regex=True)
+        features['endpoint_length'] = endpoint_series.str.len().astype(float)
+        features['has_query_params'] = has_query_params.astype(float)
         features['query_param_count'] = (
-            df['endpoint'].str.count('&').fillna(0) + 
-            df['endpoint'].str.contains(r'\?', regex=True).astype(int)
+            endpoint_series.str.count('&').fillna(0) + has_query_params.astype(int)
         ).astype(float)
-        
-        print(f"   ✓ 3 features de URL")
+
+        print("   OK 3 features de URL")
         return features
-    
+
     def _entropy_features(self, df, features):
         """Features de entropy (1 feature)"""
         print("6. Extraindo features de entropy...")
-        
+
         def calculate_entropy(text):
             """Calcula Shannon entropy de uma string"""
-            if not text or len(text) == 0:
+            if not text:
                 return 0.0
-            
-            # Conta frequência de cada caractere
-            chars = list(text)
-            if len(chars) == 0:
+
+            counts = np.fromiter(Counter(text).values(), dtype=float)
+            if counts.size == 0:
                 return 0.0
-                
-            freq = np.array([chars.count(c) for c in set(chars)])
-            freq = freq / freq.sum()
-            
-            # Shannon entropy
-            return shannon_entropy(freq, base=2)
-        
-        features['endpoint_entropy'] = df['endpoint'].apply(calculate_entropy).astype(float)
-        
-        print(f"   ✓ 1 feature de entropy")
+
+            freq = counts / counts.sum()
+            return float(shannon_entropy(freq, base=2))
+
+        endpoint_entropy_map = {
+            endpoint: calculate_entropy(endpoint)
+            for endpoint in df['endpoint'].dropna().astype(str).unique()
+        }
+        features['endpoint_entropy'] = df['endpoint'].map(endpoint_entropy_map).fillna(0.0).astype(float)
+
+        print("   OK 1 feature de entropy")
         return features
-    
+
     def _behavioral_features(self, df, features):
         """Features comportamentais (2 features)"""
         print("7. Extraindo features comportamentais...")
-        
-        # Ordena por IP e timestamp
+
         df_sorted = df.sort_values(['ip', 'timestamp']).copy()
-        
-        # Tempo desde último request do mesmo IP
-        df_sorted['time_diff'] = df_sorted.groupby('ip')['timestamp'].diff()
-        df_sorted['time_since_last_request'] = df_sorted['time_diff'].dt.total_seconds()
-        
-        # Preenche NaN (primeiro request de cada IP) com mediana
-        median_time = df_sorted['time_since_last_request'].median()
-        df_sorted['time_since_last_request'].fillna(median_time, inplace=True)
-        
-        # Requests por minuto (rolling window)
-        df_sorted['requests_per_minute'] = df_sorted.groupby('ip')['id'].transform(
-            lambda x: x.rolling(window=min(60, len(x)), min_periods=1).count()
-        )
-        
-        # Reordena de volta ao índice original
+        time_since_last = df_sorted.groupby('ip')['timestamp'].diff().dt.total_seconds()
+        median_time = time_since_last.median()
+        if pd.isna(median_time):
+            median_time = 999999.0
+        time_since_last = time_since_last.fillna(float(median_time))
+
+        # O rolling count original equivale a min(cumcount + 1, 60).
+        requests_per_minute = df_sorted.groupby('ip').cumcount().add(1).clip(upper=60).astype(float)
+
+        df_sorted['time_since_last_request'] = time_since_last
+        df_sorted['requests_per_minute'] = requests_per_minute
         df_sorted = df_sorted.sort_index()
-        
-        features['time_since_last_request'] = df_sorted['time_since_last_request'].astype(float)
-        features['time_since_last_request'] = features['time_since_last_request'].fillna(999999)
+
+        features['time_since_last_request'] = df_sorted['time_since_last_request'].astype(float).fillna(999999.0)
         features['requests_per_minute'] = df_sorted['requests_per_minute'].astype(float)
-        
-        print(f"   ✓ 2 features comportamentais")
+
+        print("   OK 2 features comportamentais")
         return features
-    
 
     def _baseline_features(self, df, features):
         """Features orientadas a baseline de normalidade para novelty detection"""
@@ -320,16 +306,18 @@ class FeatureEngineer:
         features['requests_vs_ip_baseline_ratio'] = (features['requests_per_ip_5min'] / ip_request_baseline).clip(0, 50)
 
         endpoint_frequency = df['endpoint'].value_counts(normalize=True)
-        method_endpoint_frequency = (df['method'].astype(str) + ':' + df['endpoint'].astype(str)).value_counts(normalize=True)
+        method_endpoint_keys = df['method'].astype(str) + ':' + df['endpoint'].astype(str)
+        method_endpoint_frequency = method_endpoint_keys.value_counts(normalize=True)
         features['endpoint_rarity'] = 1.0 - df['endpoint'].map(endpoint_frequency).fillna(0.0)
-        features['method_endpoint_rarity'] = 1.0 - (df['method'].astype(str) + ':' + df['endpoint'].astype(str)).map(method_endpoint_frequency).fillna(0.0)
+        features['method_endpoint_rarity'] = 1.0 - method_endpoint_keys.map(method_endpoint_frequency).fillna(0.0)
 
         features['error_burst_score'] = (features['failed_requests_ratio_5min'] * features['requests_per_ip_5min']).clip(0, 1000)
 
-        endpoint_hour_baseline = df.groupby('endpoint')['timestamp'].transform(lambda s: pd.to_datetime(s).dt.hour.median())
-        features['hour_deviation_from_endpoint_pattern'] = (pd.to_datetime(df['timestamp']).dt.hour - endpoint_hour_baseline).abs().fillna(0).clip(0, 12)
+        timestamp_hours = df['timestamp'].dt.hour.astype(float)
+        endpoint_hour_baseline = df.assign(timestamp_hour=timestamp_hours).groupby('endpoint')['timestamp_hour'].transform('median')
+        features['hour_deviation_from_endpoint_pattern'] = (timestamp_hours - endpoint_hour_baseline).abs().fillna(0).clip(0, 12)
 
-        print(f"   ? 7 features de baseline")
+        print("   OK 7 features de baseline")
         return features
 
     def get_iforest_feature_columns(self, features):
@@ -739,4 +727,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 

@@ -1,0 +1,16 @@
+[Unit]
+Description=Log Monitor MLOps Cloud POC
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/log-monitor-mlops
+RemainAfterExit=yes
+ExecStart=/usr/bin/docker compose --env-file /opt/log-monitor-mlops/.env.cloud -f /opt/log-monitor-mlops/docker/docker-compose.cloud-poc.yml up -d --build
+ExecStop=/usr/bin/docker compose --env-file /opt/log-monitor-mlops/.env.cloud -f /opt/log-monitor-mlops/docker/docker-compose.cloud-poc.yml down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -11,7 +11,6 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       - ./scripts/healthcheck_postgres.sh:/docker/scripts/healthcheck_postgres.sh:ro
     healthcheck:
       test: ["CMD", "sh", "/docker/scripts/healthcheck_postgres.sh"]
@@ -23,6 +22,25 @@ services:
       - backend
     restart: unless-stopped
 
+
+  db-migrate:
+    build:
+      context: ..
+      dockerfile: docker/dockerfiles/Dockerfile.db-migrate
+    container_name: logmonitor-db-migrate
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-logmonitor}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: "no"
+
   mlflow:
     image: python:3.12-slim
     container_name: logmonitor-mlflow
@@ -32,7 +50,7 @@ services:
       MLFLOW_TRACKING_URI: "sqlite:////mlruns/mlflow.db"
     command: >
       sh -c "pip install --no-cache-dir mlflow==2.22.2 &&
-             gunicorn --bind 0.0.0.0:5000 --workers 2 --timeout 120 mlflow.server:app"
+             mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:////mlruns/mlflow.db --default-artifact-root mlflow-artifacts:/ --artifacts-destination /mlruns --serve-artifacts"
     ports:
       - "5000:5000"
     volumes:
@@ -79,10 +97,12 @@ services:
       RATELIMIT_UPLOAD: ${RATELIMIT_UPLOAD:-10 per minute}
       RATELIMIT_FEEDBACK: ${RATELIMIT_FEEDBACK:-20 per minute}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-5}
+      RUNTIME_METRICS_FILE: /app/runtime/runtime_metrics.json
     ports:
       - "5001:5001"
     volumes:
       - logs_data:/app/logs
+      - runtime_metrics_data:/app/runtime
       - ../data:/app/data:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5001/health', timeout=5).raise_for_status()"]
@@ -93,6 +113,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
     networks:
       - backend
       - frontend
@@ -136,9 +158,14 @@ services:
       DASHBOARD_REFRESH_SECONDS: ${DASHBOARD_REFRESH_SECONDS:-30}
     ports:
       - "8501:8501"
+    volumes:
+      - ../data:/app/data:ro
+      - ../models:/app/models:ro
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
       flask-app:
         condition: service_healthy
       prometheus:
@@ -162,14 +189,16 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
       LOG_FILE: /app/logs/app.log
       INGESTER_LOG_FORMAT: ${INGESTER_LOG_FORMAT:-json}
-      INGESTER_BATCH_SIZE: "100"
-      INGESTER_POLL_INTERVAL: "10"
+      INGESTER_BATCH_SIZE: "${INGESTER_BATCH_SIZE:-100}"
+      INGESTER_POLL_INTERVAL: "${INGESTER_POLL_INTERVAL:-10}"
     volumes:
       - logs_data:/app/logs
       - ./scripts/run_ingester_loop.sh:/docker/scripts/run_ingester_loop.sh:ro
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
       flask-app:
         condition: service_healthy
     networks:
@@ -187,9 +216,13 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-logmonitor}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      RULE_ENGINE_INTERVAL_SEC: ${RULE_ENGINE_INTERVAL_SEC:-60}
+      RULE_ENGINE_WINDOW: ${RULE_ENGINE_WINDOW:-60 seconds}
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
     networks:
       - backend
     restart: unless-stopped
@@ -205,15 +238,21 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-logmonitor}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      HYBRID_POLL_INTERVAL_SEC: ${HYBRID_POLL_INTERVAL_SEC:-2}
+      HYBRID_FETCH_LIMIT: ${HYBRID_FETCH_LIMIT:-1000}
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MPLBACKEND: Agg
+      RUNTIME_METRICS_FILE: /app/runtime/runtime_metrics.json
     volumes:
       - models_data:/app/models
       - mlflow_data:/mlruns
+      - runtime_metrics_data:/app/runtime
       - ../data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
       mlflow:
         condition: service_healthy
     networks:
@@ -295,10 +334,11 @@ volumes:
     driver: local
   logs_data:
     driver: local
+  runtime_metrics_data:
+    driver: local
   prometheus_data:
     driver: local
   grafana_data:
     driver: local
   alertmanager_data:
     driver: local
-
