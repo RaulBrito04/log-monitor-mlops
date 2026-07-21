@@ -7,4 +7,4 @@ locust>=2.43.0
 
 # Code quality and security
 pylint>=3.3.0
-bandit>=1.8.0
+bandit>=1.9.4
