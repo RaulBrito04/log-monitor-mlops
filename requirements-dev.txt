@@ -6,5 +6,5 @@ hypothesis>=6.150.0
 locust>=2.43.0
 
 # Code quality and security
-pylint>=3.3.0
+pylint>=3.3.9
 bandit>=1.8.0
