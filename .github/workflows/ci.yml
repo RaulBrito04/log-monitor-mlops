@@ -169,7 +169,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build flask-app image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/dockerfiles/Dockerfile.flask
@@ -180,7 +180,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build dashboard image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/dockerfiles/Dockerfile.dashboard
@@ -191,7 +191,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build ml-pipeline image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/dockerfiles/Dockerfile.ml-pipeline
@@ -202,7 +202,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build rule-engine image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/dockerfiles/Dockerfile.rule-engine
@@ -213,7 +213,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build ingester image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/dockerfiles/Dockerfile.ingester
